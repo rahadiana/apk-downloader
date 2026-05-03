@@ -1,16 +1,20 @@
 name: Dump APK via Emulator
 
-on: 
+on:
   push:
+    branches:
+      - main
+
 jobs:
   emulator:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y wget unzip openjdk-17-jdk
+          sudo apt install -y wget unzip curl openjdk-17-jdk
 
       - name: Setup Android SDK
         run: |
@@ -26,38 +30,62 @@ jobs:
           echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
           echo "PATH=$PATH:$HOME/android-sdk/cmdline-tools/latest/bin:$HOME/android-sdk/platform-tools:$HOME/android-sdk/emulator" >> $GITHUB_ENV
 
+      - name: Export PATH
+        run: |
+          export ANDROID_HOME=$HOME/android-sdk
+          export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator
+          echo $PATH
+
       - name: Install SDK packages
         run: |
           yes | sdkmanager --licenses
-          sdkmanager "platform-tools" "emulator" "platforms;android-30" "system-images;android-30;google_apis;x86_64"
+          sdkmanager \
+            "platform-tools" \
+            "emulator" \
+            "platforms;android-30" \
+            "system-images;android-30;google_apis;x86_64"
 
       - name: Create AVD
         run: |
-          echo "no" | avdmanager create avd -n test -k "system-images;android-30;google_apis;x86_64"
+          echo "no" | avdmanager create avd -n test -k "system-images;android-30;google_apis;x86_64" --force
 
       - name: Start emulator
         run: |
-          nohup emulator -avd test -no-window -no-audio -no-boot-anim &
+          nohup emulator -avd test -no-window -no-audio -no-boot-anim -gpu off &
           adb wait-for-device
 
-      - name: Wait boot
+      - name: Wait boot complete
         run: |
-          adb shell 'while [[ -z $(getprop sys.boot_completed) ]]; do sleep 2; done;'
+          adb wait-for-device
+          adb shell 'while [[ "$(getprop sys.boot_completed)" != "1" ]]; do sleep 2; done'
+          adb shell input keyevent 82
 
-      - name: Install APK (fallback)
+      - name: Download APK (fallback source)
         run: |
-          wget -O app.apk "https://finance.en.uptodown.com/android/download"
-          adb install app.apk
+          wget --content-disposition -O app.apk "https://finance.en.uptodown.com/android/download"
+
+          echo "=== FILE INFO ==="
+          file app.apk
+          ls -lh
+
+      - name: Install APK
+        run: |
+          adb install -r app.apk
 
       - name: Dump APK path
         run: |
           adb shell pm path com.yahoo.mobile.client.android.finance
 
-      - name: Pull APK
+      - name: Pull APK(s)
         run: |
-          adb shell pm path com.yahoo.mobile.client.android.finance | sed 's/package://g' | while read line; do
+          pkg="com.yahoo.mobile.client.android.finance"
+          adb shell pm path $pkg | sed 's/package://g' | while read line; do
             adb pull "$line"
           done
+
+      - name: List dumped files
+        run: |
+          ls -lah
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
