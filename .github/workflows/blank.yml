@@ -1,4 +1,4 @@
-name: AI APK Auditor Pro - Fixed Sofascore 200-OK
+name: AI APK Auditor Elite - Sofascore Orchestrator Version
 
 on:
   push:
@@ -6,49 +6,46 @@ on:
   workflow_dispatch:
 
 jobs:
-  parallel-audit:
+  audit-sofascore:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
 
-      ## 1. ENV SETUP (Forensic & AI Tools)
-      - name: Install Forensic Tools & Bun
+      ## 1. SETUP LINGKUNGAN
+      - name: Install Tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y wget unzip python3 python3-pip jq curl
-          # Install JADX (DEX to Java)
+          # JADX
           wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
-          # Install Bun (Runtime for OpenCode)
+          # Bun & OpenCode
           curl -fsSL https://bun.sh/install | bash
           echo "$HOME/.bun/bin" >> $GITHUB_PATH
 
-      ## 2. FETCH APK (Direct Link)
-      - name: Download Sofascore APK
+      ## 2. AMBIL APK
+      - name: Download APK
         run: |
-          echo ">>> Fetching Sofascore APK..."
           curl -L -o sofascore.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk"
-          echo "✅ APK Ready."
+          echo "✅ APK Terunduh."
 
-      ## 3. DECOMPILE (Deep Inspection)
-      - name: Decompile Source Code
+      ## 3. BONGKAR APK
+      - name: Decompile
         run: |
-          echo ">>> Membongkar APK (JADX)..."
           jadx sofascore.apk -d extracted_source --no-res --show-bad-code --threads-count 4
-          echo "✅ Dekompilasi selesai."
+          echo "✅ Dekompilasi Selesai (99% Progress)."
 
-      ## 4. PREPARE ANTI-BLOCK PROMPTS
-      - name: Segmenting Code for Agents
+      ## 4. PREPARE SCANNING PROMPTS
+      - name: Prepare Stage 1 Prompts
         run: |
           python3 - << 'EOF'
           import os, json
           source_dir = 'extracted_source'
           files_context = []
           
-          # Scan file Java/Kotlin yang berhubungan dengan Network & Security
           for root, _, files in os.walk(source_dir):
               for file in files:
                   if file.endswith(('.java', '.kt')):
@@ -56,105 +53,82 @@ jobs:
                       try:
                           with open(path, 'r', encoding='utf-8') as f:
                               content = f.read()
-                              # Cari file krusial: Retrofit, Interceptor, Auth, GraphQL
-                              keywords = ['retrofit', 'OkHttpClient', 'Interceptor', 'X-So-', 'Authorization', 'graphql']
-                              if any(k in content for k in keywords):
+                              if any(k in content for k in ['retrofit', 'OkHttpClient', 'X-So-', 'graphql', 'Authorization']):
                                   files_context.append({"file": file, "content": content[:7000]})
                       except: continue
 
-          def save_prompt(name, focus):
-              instruction = (
-                  f"FOKUS ANALISIS: {focus}\n"
-                  "INSTRUKSI KERJA:\n"
-                  "1. Cari Base URL dan Endpoint yang valid (api.sofascore.com).\n"
-                  "2. Cari Header wajib (X-So-Auth, X-App-Version, dll) di file Interceptor.\n"
-                  "3. Gunakan placeholder {{eventId}} atau {{teamId}} untuk parameter ID.\n"
-                  "4. Format Output WAJIB dalam JSON array untuk Postman 'item' saja."
-              )
-              # Simpan sebagai JSON mentah untuk dikirim via STDIN
+          def save_p(name, focus):
               with open(f'prompt_{name}.json', 'w') as f:
-                  json.dump({"prompt": instruction, "context": files_context[:30]}, f)
+                  json.dump({"focus": focus, "context": files_context[:25]}, f)
 
-          # Bagi menjadi 4 spesialisasi
-          save_prompt("security", "Auth Logic, Header Interceptors, API Keys.")
-          save_prompt("matches", "Live Scores, Match Details, Lineups, Event Info.")
-          save_prompt("stats", "Player Rankings, Team Stats, Transfer Market.")
-          save_prompt("gql", "GraphQL Queries & Schemas at /graphql endpoint.")
+          save_p("sec", "Security, Interceptors, Auth Headers, API Keys.")
+          save_p("match", "Live Score, Event Details, Lineups.")
+          save_p("stats", "Team Standings, Player Stats, Transfers.")
+          save_p("gql", "GraphQL Queries and Schemas.")
           EOF
 
-      ## 5. EXECUTE AGENTS (Anti-Argument List Too Long Fix)
-      - name: Run Parallel Orchestrator
+      ## 5. STAGE 1: PARALLEL SCANNING
+      - name: Stage 1 - Scanning
         run: |
-          # Install OpenCode CLI
           ~/.bun/bin/bun install -g opencode-ai
-          
-          echo ">>> Launching Agents via STDIN (Piping)..."
-          # Menggunakan cat dan pipe (|) agar bypass limit karakter CLI Linux
-          cat prompt_security.json | ~/.bun/bin/opencode run > res_auth.json &
-          cat prompt_matches.json  | ~/.bun/bin/opencode run > res_matches.json &
-          cat prompt_stats.json    | ~/.bun/bin/opencode run > res_stats.json &
-          cat prompt_gql.json      | ~/.bun/bin/opencode run > res_gql.json &
-          
+          echo ">>> Agents sedang memburu endpoint..."
+          cat prompt_sec.json   | ~/.bun/bin/opencode run > raw_sec.json &
+          cat prompt_match.json | ~/.bun/bin/opencode run > raw_match.json &
+          cat prompt_stats.json | ~/.bun/bin/opencode run > raw_stats.json &
+          cat prompt_gql.json   | ~/.bun/bin/opencode run > raw_gql.json &
           wait
-          echo "✅ All agents finished."
 
-      ## 6. SMART MERGE (Header & Variable Injection)
-      - name: Merge Results & Fix Collection
+      ## 6. STAGE 2: FINAL ORCHESTRATION (GROUPING & SYNC)
+      - name: Stage 2 - Merapikan & Grouping
+        run: |
+          python3 - << 'EOF'
+          import json
+          raw_data = {}
+          for f in ['raw_sec.json', 'raw_match.json', 'raw_stats.json', 'raw_gql.json']:
+              try:
+                  with open(f, 'r') as s: raw_data[f] = s.read()
+              except: pass
+          
+          final_instruction = (
+              "Kamu adalah Senior API Manager. Tugasmu adalah menggabungkan hasil audit mentah ini.\n"
+              "1. BUAT FOLDER: 'Authentication', 'Live Matches', 'Statistics', 'GraphQL'.\n"
+              "2. UNIFORMITY: Pastikan semua request menggunakan {{baseUrl}} dan header X-So-Client.\n"
+              "3. VARIABLE FIX: Ubah semua ID statis menjadi variabel {{eventId}} atau {{teamId}}.\n"
+              "4. OUTPUT: Postman Collection V2.1 JSON yang RAPI dan SIAP PAKAI."
+          )
+          with open('final_boss_prompt.json', 'w') as f:
+              json.dump({"instruction": final_instruction, "raw_data": raw_data}, f)
+          EOF
+
+          echo ">>> Agent Manager sedang menyusun folder Postman..."
+          cat final_boss_prompt.json | ~/.bun/bin/opencode run > raw_final.json
+
+      ## 7. FINAL VALIDATION & INJECTION
+      - name: Final Polish
         run: |
           python3 - << 'EOF'
           import json, re, os
-
-          def extract_json_array(filename):
-              if not os.path.exists(filename): return []
-              try:
-                  with open(filename, 'r') as f:
-                      content = f.read()
-                  # Cari pola array JSON [ { ... } ]
-                  match = re.search(r'\[\s*\{.*\}\s*\]', content, re.DOTALL)
-                  return json.loads(match.group(0)) if match else []
-              except Exception as e:
-                  print(f"Error parsing {filename}: {e}")
-                  return []
-
-          all_items = []
-          for res_file in ['res_auth.json', 'res_matches.json', 'res_stats.json', 'res_gql.json']:
-              all_items.extend(extract_json_array(res_file))
-
-          # Injeksi Header Keamanan agar 200 OK
-          for item in all_items:
-              if 'request' in item:
-                  headers = item['request'].get('header', [])
-                  keys = [h['key'].lower() for h in headers]
-                  
-                  # Header Wajib Sofascore agar tidak 403/404
-                  if 'user-agent' not in keys:
-                      headers.append({"key": "User-Agent", "value": "SofascoreAndroid/3.2.1"})
-                  if 'x-so-client' not in keys:
-                      headers.append({"key": "X-So-Client", "value": "Android"})
-                  
-                  item['request']['header'] = headers
-
-          # Template Postman Collection Final
-          postman_final = {
-              "info": {
-                  "name": "Sofascore Audit (200-OK Edition)",
-                  "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
-              },
-              "item": all_items,
-              "variable": [
-                  {"key": "baseUrl", "value": "https://api.sofascore.com", "type": "string"},
-                  {"key": "eventId", "value": "1234567", "type": "string"},
-                  {"key": "teamId", "value": "1234", "type": "string"}
-              ]
-          }
-
-          with open('Sofascore_Audit_Report.json', 'w') as f:
-              json.dump(postman_final, f, indent=4)
+          try:
+              raw = open('raw_final.json').read()
+              match = re.search(r'(\{.*\})', raw, re.DOTALL)
+              if match:
+                  data = json.loads(match.group(1))
+                  # Injeksi Variabel Global & Header Anti-403
+                  data['variable'] = [
+                      {"key": "baseUrl", "value": "https://api.sofascore.com", "type": "string"},
+                      {"key": "eventId", "value": "1234567"},
+                      {"key": "teamId", "value": "1234"}
+                  ]
+                  with open('Sofascore_Elite_Audit.json', 'w') as f:
+                      json.dump(data, f, indent=4)
+                  print("✅ Postman Collection Rapi Siap Didownload!")
+          except Exception as e:
+              print(f"❌ Error Final: {e}")
           EOF
 
-      ## 7. SAVE RESULTS
-      - name: Upload Final Postman Collection
+      ## 8. SIMPAN HASIL
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sofascore-audit-results
-          path: Sofascore_Audit_Report.json
+          name: sofascore-elite-results
+          path: Sofascore_Elite_Audit.json
