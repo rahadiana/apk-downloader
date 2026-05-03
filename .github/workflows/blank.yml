@@ -7,99 +7,64 @@ on:
 jobs:
   extract:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
       - name: Install deps
         run: |
           sudo apt update
-          sudo apt install -y wget unzip python3
+          sudo apt install -y curl unzip python3
 
-      # -----------------------
-      # 1) Download APK
-      # -----------------------
-      - name: Download APK (Yahoo Finance)
+      - name: Download APK
         run: |
-          wget --content-disposition -O app.apk "https://finance.en.uptodown.com/android/download"
+          curl -L -o app.apk "https://finance.en.uptodown.com/android/download"
+
+          echo "=== FILE INFO ==="
           file app.apk
           ls -lh
 
-      # -----------------------
-      # 2) Install JADX (CLI)
-      # -----------------------
+          file app.apk | grep "Zip archive" || (echo "Bukan APK" && exit 1)
+
       - name: Install JADX
         run: |
-          wget https://github.com/skylot/jadx/releases/latest/download/jadx-1.5.0.zip
-          unzip -q jadx-1.5.0.zip
+          curl -L -o jadx.zip https://github.com/skylot/jadx/releases/latest/download/jadx-1.5.0.zip
+          unzip -q jadx.zip
 
-      # -----------------------
-      # 3) Decompile
-      # -----------------------
-      - name: Decompile APK
+      - name: Decompile
         run: |
-          ./jadx-*/bin/jadx -d out app.apk
-          ls -lah out
+          JADX_DIR=$(ls -d jadx-* | head -n 1)
+          $JADX_DIR/bin/jadx -d out app.apk
 
-      # -----------------------
-      # 4) Extract endpoints → JSON
-      # -----------------------
-      - name: Extract endpoints
+      # 🔥 FIX DI SINI (NO HEREDOC)
+      - name: Create extractor script
         run: |
-          python3 - << 'PY'
+          cat << 'EOF' > extract.py
 import os, re, json
 
-root = "out/sources"
-url_regex = re.compile(r'https?://[^\s"\'<>]+')
+urls = set()
 
-hits = set()
-
-for dirpath, _, filenames in os.walk(root):
-    for f in filenames:
+for root, _, files in os.walk("out"):
+    for f in files:
         if f.endswith((".java", ".kt")):
-            p = os.path.join(dirpath, f)
             try:
-                with open(p, "r", errors="ignore") as fh:
-                    text = fh.read()
-                    for m in url_regex.findall(text):
-                        hits.add(m)
+                with open(os.path.join(root, f), errors="ignore") as fh:
+                    txt = fh.read()
+                    urls.update(re.findall(r'https?://[^\\s"\\'<>]+', txt))
             except:
                 pass
 
-# simple normalization / filtering
-def normalize(u):
-    return u.strip().rstrip(');,\'"')
+urls = sorted(urls)
 
-urls = sorted({normalize(u) for u in hits if len(u) < 300})
+with open("endpoints.json", "w") as f:
+    json.dump({"count": len(urls), "urls": urls}, f, indent=2)
 
-# group by host
-by_host = {}
-for u in urls:
-    host = re.sub(r'^https?://', '', u).split('/')[0]
-    by_host.setdefault(host, []).append(u)
+print("FOUND:", len(urls))
+EOF
 
-out = {
-  "total": len(urls),
-  "hosts": {k: len(v) for k,v in by_host.items()},
-  "endpoints": urls
-}
-
-with open("endpoints.json","w") as f:
-    json.dump(out, f, indent=2)
-
-print(f"FOUND: {len(urls)} URLs")
-PY
-
-      # -----------------------
-      # 5) Show result (ringkas)
-      # -----------------------
-      - name: Preview endpoints
+      - name: Run extractor
         run: |
-          cat endpoints.json | head -n 200
+          python3 extract.py
 
-      # -----------------------
-      # 6) Upload artifact
-      # -----------------------
-      - name: Upload JSON
+      - name: Upload result
         uses: actions/upload-artifact@v4
         with:
           name: endpoints
