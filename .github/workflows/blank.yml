@@ -10,82 +10,82 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Install deps
-        run: sudo apt update && sudo apt install -y curl unzip python3
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt update && sudo apt install -y unzip curl python3
 
       # -----------------------
-      # 1) Download APK (fail-fast + retry)
+      # 1. Load APK (NO INTERNET)
       # -----------------------
-
-      - name: Download APK (with UA)
+      - name: Prepare APK
         run: |
           set -e
-      
-          URL="https://d.apkpure.com/b/APK/com.yahoo.mobile.client.android.finance"
-      
-          curl -L \
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-            -o app.apk "$URL"
-      
+
+          cp apk/yahoo.apk app.apk
+
+          echo "=== APK INFO ==="
           ls -lh app.apk
           file app.apk
 
+          # VALIDASI APK
+          file app.apk | grep -q "Zip archive" || (echo "APK tidak valid" && exit 1)
+
+          unzip -l app.apk | grep -q "classes.dex" || (echo "Tidak ada classes.dex" && exit 1)
+
       # -----------------------
-      # 2) Install JADX (stable URL)
+      # 2. Install JADX (STABLE)
       # -----------------------
       - name: Install JADX
         run: |
           set -e
 
-          URL="https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip"
-          curl -fL --retry 3 --retry-delay 2 -o jadx.zip "$URL"
-
-          ls -lh jadx.zip
-          file jadx.zip
-
-          size=$(stat -c%s jadx.zip)
-          if [ "$size" -lt 5000000 ]; then
-            echo "Download JADX gagal"
-            exit 1
-          fi
+          curl -fL --retry 3 -o jadx.zip \
+          https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
 
           unzip -q jadx.zip
 
-          echo "=== JADX CONTENT ==="
+          echo "=== CHECK JADX ==="
           ls -lah
 
-          test -f bin/jadx || (echo "jadx binary tidak ditemukan" && exit 1)
+          test -f bin/jadx || (echo "jadx tidak ditemukan" && exit 1)
           chmod +x bin/jadx
 
       # -----------------------
-      # 3) Decompile
+      # 3. Decompile
       # -----------------------
       - name: Decompile APK
         run: |
           set -e
+
+          mkdir -p out
+
           ./bin/jadx -d out app.apk
+
           echo "=== OUT DIR ==="
-          ls -lah out
+          ls -lah out || (echo "out kosong" && exit 1)
 
       # -----------------------
-      # 4) Extract endpoints
+      # 4. Extract endpoint
       # -----------------------
       - name: Extract endpoints
         run: |
           grep -RhoE "https?://[^\" ]+" out | sort -u > urls.txt || true
+
           echo "TOTAL URL:"
           wc -l urls.txt
           head -n 50 urls.txt
 
       # -----------------------
-      # 5) Convert to JSON
+      # 5. Convert JSON
       # -----------------------
       - name: Convert to JSON
         run: |
           python3 -c "import json; print(json.dumps({'urls':[l.strip() for l in open('urls.txt')]}))" > endpoints.json
 
       # -----------------------
-      # 6) Upload result
+      # 6. Upload result
       # -----------------------
       - name: Upload result
         uses: actions/upload-artifact@v4
