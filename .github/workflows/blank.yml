@@ -1,20 +1,25 @@
-name: AI APK Auditor Elite - Sofascore Orchestrator Version
+name: Universal AI APK Auditor - Multi-Agent Orchestrator
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'Masukkan Direct Link Download APK'
+        required: true
+        default: 'https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk'
 
 jobs:
-  audit-sofascore:
+  universal-audit:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
 
-      ## 1. SETUP LINGKUNGAN
-      - name: Install Tools
+      ## 1. SETUP TOOLS
+      - name: Install Forensic Tools & Bun
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y wget unzip python3 python3-pip jq curl
@@ -26,25 +31,34 @@ jobs:
           curl -fsSL https://bun.sh/install | bash
           echo "$HOME/.bun/bin" >> $GITHUB_PATH
 
-      ## 2. AMBIL APK
-      - name: Download APK
+      ## 2. DYNAMIC FETCH APK
+      - name: Download Target APK
         run: |
-          curl -L -o sofascore.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk"
+          echo ">>> Fetching APK dari: ${{ github.event.inputs.apk_url }}"
+          curl -L -o target_app.apk "${{ github.event.inputs.apk_url }}"
           echo "✅ APK Terunduh."
 
-      ## 3. BONGKAR APK
+      ## 3. UNIVERSAL DECOMPILE
       - name: Decompile
         run: |
-          jadx sofascore.apk -d extracted_source --no-res --show-bad-code --threads-count 4
-          echo "✅ Dekompilasi Selesai (99% Progress)."
+          jadx target_app.apk -d extracted_source --no-res --show-bad-code --threads-count 4
+          echo "✅ Dekompilasi Selesai."
 
-      ## 4. PREPARE SCANNING PROMPTS
-      - name: Prepare Stage 1 Prompts
+      ## 4. HEURISTIC CONTEXT EXTRACTION
+      - name: Smart Context Filtering
         run: |
           python3 - << 'EOF'
           import os, json
           source_dir = 'extracted_source'
           files_context = []
+          
+          # Nyari file yang punya pola "Bau-bau" Networking & API
+          # Gak peduli nama app-nya apa, yang penting ada standar Android-nya
+          patterns = [
+              'retrofit', 'okhttp', 'httpclient', 'interceptor', 
+              'authorization', 'bearer', 'api_key', 'graphql', 
+              'firebase', 'database', '@GET', '@POST', 'host', 'url'
+          ]
           
           for root, _, files in os.walk(source_dir):
               for file in files:
@@ -53,57 +67,63 @@ jobs:
                       try:
                           with open(path, 'r', encoding='utf-8') as f:
                               content = f.read()
-                              if any(k in content for k in ['retrofit', 'OkHttpClient', 'X-So-', 'graphql', 'Authorization']):
+                              if any(k in content.lower() for k in patterns):
                                   files_context.append({"file": file, "content": content[:7000]})
                       except: continue
+
+          # Sort biar yang paling relevan (paling banyak keyword) naik ke atas
+          files_context.sort(key=lambda x: sum(p in x['content'].lower() for p in patterns), reverse=True)
 
           def save_p(name, focus):
               with open(f'prompt_{name}.json', 'w') as f:
                   json.dump({"focus": focus, "context": files_context[:25]}, f)
 
-          save_p("sec", "Security, Interceptors, Auth Headers, API Keys.")
-          save_p("match", "Live Score, Event Details, Lineups.")
-          save_p("stats", "Team Standings, Player Stats, Transfers.")
-          save_p("gql", "GraphQL Queries and Schemas.")
+          # 4 Agent Spesialis Umum
+          save_p("gatekeeper", "Auth Logic, Token handling, Headers, Interceptors, and Security Keys.")
+          save_p("explorer", "Main API Endpoints, Business Logic, and Data Retrieval paths.")
+          save_p("database", "Firebase, GraphQL, Cloud DBs, and Background Sync endpoints.")
+          save_p("params", "Query Parameters, POST Body structures, and Variable replacements.")
           EOF
 
-      ## 5. STAGE 1: PARALLEL SCANNING
-      - name: Stage 1 - Scanning
+      ## 5. STAGE 1: PARALLEL DISCOVERY
+      - name: Stage 1 - Parallel Discovery
         run: |
           ~/.bun/bin/bun install -g opencode-ai
-          echo ">>> Agents sedang memburu endpoint..."
-          cat prompt_sec.json   | ~/.bun/bin/opencode run > raw_sec.json &
-          cat prompt_match.json | ~/.bun/bin/opencode run > raw_match.json &
-          cat prompt_stats.json | ~/.bun/bin/opencode run > raw_stats.json &
-          cat prompt_gql.json   | ~/.bun/bin/opencode run > raw_gql.json &
+          echo ">>> Agents sedang membedah logika aplikasi..."
+          cat prompt_gatekeeper.json | ~/.bun/bin/opencode run > raw_sec.json &
+          cat prompt_explorer.json   | ~/.bun/bin/opencode run > raw_core.json &
+          cat prompt_database.json   | ~/.bun/bin/opencode run > raw_db.json &
+          cat prompt_params.json     | ~/.bun/bin/opencode run > raw_params.json &
           wait
 
-      ## 6. STAGE 2: FINAL ORCHESTRATION (GROUPING & SYNC)
-      - name: Stage 2 - Merapikan & Grouping
+      ## 6. STAGE 2: THE CONSOLIDATOR (MANAGER AGENT)
+      - name: Stage 2 - Merapikan Collection
         run: |
           python3 - << 'EOF'
           import json
           raw_data = {}
-          for f in ['raw_sec.json', 'raw_match.json', 'raw_stats.json', 'raw_gql.json']:
+          for f in ['raw_sec.json', 'raw_core.json', 'raw_db.json', 'raw_params.json']:
               try:
                   with open(f, 'r') as s: raw_data[f] = s.read()
               except: pass
           
           final_instruction = (
-              "Kamu adalah Senior API Manager. Tugasmu adalah menggabungkan hasil audit mentah ini.\n"
-              "1. BUAT FOLDER: 'Authentication', 'Live Matches', 'Statistics', 'GraphQL'.\n"
-              "2. UNIFORMITY: Pastikan semua request menggunakan {{baseUrl}} dan header X-So-Client.\n"
-              "3. VARIABLE FIX: Ubah semua ID statis menjadi variabel {{eventId}} atau {{teamId}}.\n"
-              "4. OUTPUT: Postman Collection V2.1 JSON yang RAPI dan SIAP PAKAI."
+              "Kamu adalah Expert Reverse Engineer & API Architect.\n"
+              "Tugasmu: Gabungkan semua temuan mentah dari para agent menjadi satu Postman Collection.\n"
+              "1. IDENTIFIKASI NAMA APP: Cari tahu nama aplikasi/brand-nya untuk judul collection.\n"
+              "2. FOLDERIZE: Kelompokkan request ke folder logis (Auth, Core API, Third-party, dll).\n"
+              "3. ABSTRAKSI: Cari Base URL utama dan jadikan variabel {{baseUrl}}.\n"
+              "4. VARIABLE INJECTION: Ganti semua ID/Token statis dengan variabel {{id}} atau {{token}}.\n"
+              "5. CLEANUP: Berikan output JSON V2.1 yang valid, tanpa penjelasan teks."
           )
-          with open('final_boss_prompt.json', 'w') as f:
+          with open('final_manager_prompt.json', 'w') as f:
               json.dump({"instruction": final_instruction, "raw_data": raw_data}, f)
           EOF
 
-          echo ">>> Agent Manager sedang menyusun folder Postman..."
-          cat final_boss_prompt.json | ~/.bun/bin/opencode run > raw_final.json
+          echo ">>> Manager Agent sedang menyusun laporan akhir..."
+          cat final_manager_prompt.json | ~/.bun/bin/opencode run > raw_final.json
 
-      ## 7. FINAL VALIDATION & INJECTION
+      ## 7. FINAL POLISHING & EXPORT
       - name: Final Polish
         run: |
           python3 - << 'EOF'
@@ -113,22 +133,24 @@ jobs:
               match = re.search(r'(\{.*\})', raw, re.DOTALL)
               if match:
                   data = json.loads(match.group(1))
-                  # Injeksi Variabel Global & Header Anti-403
-                  data['variable'] = [
-                      {"key": "baseUrl", "value": "https://api.sofascore.com", "type": "string"},
-                      {"key": "eventId", "value": "1234567"},
-                      {"key": "teamId", "value": "1234"}
-                  ]
-                  with open('Sofascore_Elite_Audit.json', 'w') as f:
+                  # Injeksi Variable default jika belum ada
+                  if 'variable' not in data: data['variable'] = []
+                  
+                  # Coba tebak Base URL kalau AI gak nemu
+                  current_keys = [v['key'] for v in data['variable']]
+                  if 'baseUrl' not in current_keys:
+                      data['variable'].append({"key": "baseUrl", "value": "https://api.example.com", "type": "string"})
+                  
+                  with open('Universal_APK_Audit.json', 'w') as f:
                       json.dump(data, f, indent=4)
-                  print("✅ Postman Collection Rapi Siap Didownload!")
+                  print("✅ Audit Universal Selesai!")
           except Exception as e:
               print(f"❌ Error Final: {e}")
           EOF
 
-      ## 8. SIMPAN HASIL
-      - name: Upload Artifact
+      ## 8. UPLOAD RESULT
+      - name: Upload Result
         uses: actions/upload-artifact@v4
         with:
-          name: sofascore-elite-results
-          path: Sofascore_Elite_Audit.json
+          name: universal-audit-results
+          path: Universal_APK_Audit.json
