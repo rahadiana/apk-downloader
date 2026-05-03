@@ -1,4 +1,4 @@
-name: Universal AI APK Auditor - Multi-Agent Orchestrator
+name: Universal AI APK Auditor - Elite Orchestrator
 
 on:
   push:
@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
     inputs:
       apk_url:
-        description: 'Masukkan Direct Link Download APK'
-        required: true
+        description: 'Masukkan Direct Link APK'
+        required: false
         default: 'https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk'
 
 jobs:
@@ -23,7 +23,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y wget unzip python3 python3-pip jq curl
-          # JADX
+          # JADX Decompiler
           wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
@@ -31,16 +31,23 @@ jobs:
           curl -fsSL https://bun.sh/install | bash
           echo "$HOME/.bun/bin" >> $GITHUB_PATH
 
-      ## 2. DYNAMIC FETCH APK
+      ## 2. DYNAMIC FETCH APK (ANTI-ERROR LOGIC)
       - name: Download Target APK
         run: |
-          echo ">>> Fetching APK dari: ${{ github.event.inputs.apk_url }}"
-          curl -L -o target_app.apk "${{ github.event.inputs.apk_url }}"
-          echo "✅ APK Terunduh."
+          # Gunakan input dari manual trigger, jika kosong pakai default
+          APK_URL="${{ github.event.inputs.apk_url }}"
+          if [ -z "$APK_URL" ]; then
+            APK_URL="https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk"
+          fi
+          
+          echo ">>> Fetching APK dari: $APK_URL"
+          curl -L -f -o target_app.apk "$APK_URL" || { echo "❌ Download Gagal! Pastikan Link Direct."; exit 1; }
+          echo "✅ APK Terunduh: $(ls -lh target_app.apk | awk '{print $5}')"
 
       ## 3. UNIVERSAL DECOMPILE
-      - name: Decompile
+      - name: Decompile Source Code
         run: |
+          echo ">>> Membongkar APK... (Mungkin butuh beberapa menit)"
           jadx target_app.apk -d extracted_source --no-res --show-bad-code --threads-count 4
           echo "✅ Dekompilasi Selesai."
 
@@ -52,12 +59,11 @@ jobs:
           source_dir = 'extracted_source'
           files_context = []
           
-          # Nyari file yang punya pola "Bau-bau" Networking & API
-          # Gak peduli nama app-nya apa, yang penting ada standar Android-nya
+          # Heuristic patterns untuk mendeteksi API & Networking di app apapun
           patterns = [
               'retrofit', 'okhttp', 'httpclient', 'interceptor', 
               'authorization', 'bearer', 'api_key', 'graphql', 
-              'firebase', 'database', '@GET', '@POST', 'host', 'url'
+              'firebase', '@GET', '@POST', 'hostname', 'client_id'
           ]
           
           for root, _, files in os.walk(source_dir):
@@ -68,36 +74,37 @@ jobs:
                           with open(path, 'r', encoding='utf-8') as f:
                               content = f.read()
                               if any(k in content.lower() for k in patterns):
+                                  # Ambil 7000 karakter pertama sebagai konteks
                                   files_context.append({"file": file, "content": content[:7000]})
                       except: continue
 
-          # Sort biar yang paling relevan (paling banyak keyword) naik ke atas
+          # Urutkan berdasarkan kepadatan keyword agar AI dapet file yang paling 'daging'
           files_context.sort(key=lambda x: sum(p in x['content'].lower() for p in patterns), reverse=True)
 
           def save_p(name, focus):
               with open(f'prompt_{name}.json', 'w') as f:
-                  json.dump({"focus": focus, "context": files_context[:25]}, f)
+                  json.dump({"focus": focus, "context": files_context[:30]}, f)
 
-          # 4 Agent Spesialis Umum
-          save_p("gatekeeper", "Auth Logic, Token handling, Headers, Interceptors, and Security Keys.")
-          save_p("explorer", "Main API Endpoints, Business Logic, and Data Retrieval paths.")
-          save_p("database", "Firebase, GraphQL, Cloud DBs, and Background Sync endpoints.")
-          save_p("params", "Query Parameters, POST Body structures, and Variable replacements.")
+          save_p("security", "Cari Auth Logic, Header Interceptor, API Keys, dan Token handling.")
+          save_p("explorer", "Cari Core API Endpoints, Business Logic, dan Data Retrieval.")
+          save_p("database", "Cari Firebase, GraphQL, dan Background Sync endpoints.")
+          save_p("params", "Cari Query Parameters dan struktur POST Body (JSON).")
           EOF
 
       ## 5. STAGE 1: PARALLEL DISCOVERY
-      - name: Stage 1 - Parallel Discovery
+      - name: Stage 1 - Parallel Scanning
         run: |
           ~/.bun/bin/bun install -g opencode-ai
-          echo ">>> Agents sedang membedah logika aplikasi..."
-          cat prompt_gatekeeper.json | ~/.bun/bin/opencode run > raw_sec.json &
-          cat prompt_explorer.json   | ~/.bun/bin/opencode run > raw_core.json &
-          cat prompt_database.json   | ~/.bun/bin/opencode run > raw_db.json &
-          cat prompt_params.json     | ~/.bun/bin/opencode run > raw_params.json &
+          echo ">>> 4 Agent sedang bekerja secara paralel..."
+          cat prompt_security.json | ~/.bun/bin/opencode run > raw_sec.json &
+          cat prompt_explorer.json | ~/.bun/bin/opencode run > raw_core.json &
+          cat prompt_database.json | ~/.bun/bin/opencode run > raw_db.json &
+          cat prompt_params.json   | ~/.bun/bin/opencode run > raw_params.json &
           wait
+          echo "✅ Scanning selesai."
 
       ## 6. STAGE 2: THE CONSOLIDATOR (MANAGER AGENT)
-      - name: Stage 2 - Merapikan Collection
+      - name: Stage 2 - Orchestrating & Grouping
         run: |
           python3 - << 'EOF'
           import json
@@ -108,22 +115,22 @@ jobs:
               except: pass
           
           final_instruction = (
-              "Kamu adalah Expert Reverse Engineer & API Architect.\n"
-              "Tugasmu: Gabungkan semua temuan mentah dari para agent menjadi satu Postman Collection.\n"
-              "1. IDENTIFIKASI NAMA APP: Cari tahu nama aplikasi/brand-nya untuk judul collection.\n"
-              "2. FOLDERIZE: Kelompokkan request ke folder logis (Auth, Core API, Third-party, dll).\n"
-              "3. ABSTRAKSI: Cari Base URL utama dan jadikan variabel {{baseUrl}}.\n"
-              "4. VARIABLE INJECTION: Ganti semua ID/Token statis dengan variabel {{id}} atau {{token}}.\n"
-              "5. CLEANUP: Berikan output JSON V2.1 yang valid, tanpa penjelasan teks."
+              "Kamu adalah Expert Reverse Engineer. Gabungkan hasil temuan mentah ini.\n"
+              "TUGAS UTAMA:\n"
+              "1. IDENTIFIKASI NAMA APLIKASI: Tebak dari kode (misal: Sofascore, Gojek, dll).\n"
+              "2. FOLDERIZE: Kelompokkan request ke folder (Auth, User Data, Feature A, Feature B).\n"
+              "3. VARIABLE SYNC: Gunakan {{baseUrl}} untuk host dan {{id}} untuk parameter dinamis.\n"
+              "4. GLOBAL HEADERS: Terapkan Header wajib (seperti User-Agent atau Auth) ke semua request.\n"
+              "5. OUTPUT: Berikan satu JSON Postman Collection V2.1 yang utuh dan rapi."
           )
-          with open('final_manager_prompt.json', 'w') as f:
+          with open('final_boss_prompt.json', 'w') as f:
               json.dump({"instruction": final_instruction, "raw_data": raw_data}, f)
           EOF
 
-          echo ">>> Manager Agent sedang menyusun laporan akhir..."
-          cat final_manager_prompt.json | ~/.bun/bin/opencode run > raw_final.json
+          echo ">>> Manager Agent sedang menyusun struktur Postman..."
+          cat final_boss_prompt.json | ~/.bun/bin/opencode run > raw_final.json
 
-      ## 7. FINAL POLISHING & EXPORT
+      ## 7. FINAL POLISH & VALIDATION
       - name: Final Polish
         run: |
           python3 - << 'EOF'
@@ -136,21 +143,21 @@ jobs:
                   # Injeksi Variable default jika belum ada
                   if 'variable' not in data: data['variable'] = []
                   
-                  # Coba tebak Base URL kalau AI gak nemu
-                  current_keys = [v['key'] for v in data['variable']]
-                  if 'baseUrl' not in current_keys:
+                  # Cek apakah baseUrl sudah ada
+                  keys = [v['key'] for v in data['variable']]
+                  if 'baseUrl' not in keys:
                       data['variable'].append({"key": "baseUrl", "value": "https://api.example.com", "type": "string"})
                   
-                  with open('Universal_APK_Audit.json', 'w') as f:
+                  with open('Universal_Audit_Result.json', 'w') as f:
                       json.dump(data, f, indent=4)
-                  print("✅ Audit Universal Selesai!")
+                  print("✅ Postman Collection berhasil dibuat!")
           except Exception as e:
-              print(f"❌ Error Final: {e}")
+              print(f"❌ Gagal memproses hasil final: {e}")
           EOF
 
-      ## 8. UPLOAD RESULT
-      - name: Upload Result
+      ## 8. ARTIFACTS
+      - name: Upload Final Audit
         uses: actions/upload-artifact@v4
         with:
-          name: universal-audit-results
-          path: Universal_APK_Audit.json
+          name: universal-api-audit
+          path: Universal_Audit_Result.json
