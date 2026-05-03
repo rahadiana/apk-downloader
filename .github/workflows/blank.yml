@@ -31,7 +31,7 @@ jobs:
           PKG="com.yahoo.mobile.client.android.finance"
       
           # Ambil link download dari APKCombo
-          DL_PAGE=$(curl -fsSL "https://apkcombo.com/financial-times-business-news/com.ft.news/download/apk")
+          DL_PAGE=$(curl -fsSL "https://apkcombo.com/d?u=aHR0cHM6Ly9kb3dubG9hZC5wdXJlYXBrLmNvbS9iL0FQSy9ZMjl0TG1aMExtNWxkM05mTWpFME1qSTVNakF3TUY4MU16RTBZbVkxTXc/YXMyPWZiYzQzMDc0ZGJkODY4ZTA1MWZmMTUzNGE5ZTgwYTI4NmJkMjFkYTUmaz03ZWJhMDNiZGM4Y2Q5NmM4N2Y4MzU4NzMwMmNhOWYyZjZiZDIxZGE1Jl9wPVkyOXRMbVowTG01bGQzTSZjPTElN0NORVdTX0FORF9NQUdBWklORVMlN0NiMmxrUFRrbVpHVjJQVlJvWlNVeU1FWnBibUZ1WTJsaGJDVXlNRlJwYldWekpUSXdUR2x0YVhSbFpDWjBQV0Z3YXlaelBUSXdOamN3TVRrekpuWnVQVEl1TWpreUxqQXRjMjVoY0hOb2IzUXVNakF4TGpFeU5EVTVOVEUwTmpNeE1Ua3lMalUzTmpJbE1rSXpZekJsTlRJekpuWmpQVEl4TkRJeU9USXdNREEmX2ZuPVJtbHVZVzVqYVdGc0sxUnBiV1Z6SlROQkswSjFjMmx1WlhOekswNWxkM05mTWk0eU9USXVNQzF6Ym1Gd2MyaHZkQzR5TURFdU1USTBOVGsxTVRRMk16RXhPVEl1TlRjMk1pVXlRak5qTUdVMU1qTmZZWEJyWTI5dFltOHVZMjl0TG1Gd2F3JTNEJTNE&fp=b711a1a1dbd5cac2b2f74e974a310840&ip=103.119.138.251&package_name=com.ft.news&lang=en")
           APK_URL=$(echo "$DL_PAGE" | grep -oE 'https://[^"]+\.apk[^"]*' | head -1)
       
           if [ -z "$APK_URL" ]; then
