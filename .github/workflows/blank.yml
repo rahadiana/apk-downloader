@@ -1,4 +1,4 @@
-name: AI APK Auditor Pro - Sofascore 200-OK Edition
+name: AI APK Auditor Pro - Fixed Sofascore 200-OK
 
 on:
   push:
@@ -13,41 +13,42 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      ## 1. ENV SETUP
-      - name: Install Forensic Tools
+      ## 1. ENV SETUP (Forensic & AI Tools)
+      - name: Install Forensic Tools & Bun
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y wget unzip python3 python3-pip jq curl
-          # JADX Decompiler
+          # Install JADX (DEX to Java)
           wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
-          # Bun & OpenCode
+          # Install Bun (Runtime for OpenCode)
           curl -fsSL https://bun.sh/install | bash
           echo "$HOME/.bun/bin" >> $GITHUB_PATH
 
-      ## 2. FETCH APK (DIRECT LINK)
+      ## 2. FETCH APK (Direct Link)
       - name: Download Sofascore APK
         run: |
+          echo ">>> Fetching Sofascore APK..."
           curl -L -o sofascore.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk"
           echo "✅ APK Ready."
 
-      ## 3. DECOMPILE (DEEP SCAN)
-      - name: Decompile
+      ## 3. DECOMPILE (Deep Inspection)
+      - name: Decompile Source Code
         run: |
-          # --show-bad-code dipaksa agar AI bisa liat logika yang obfuscated
+          echo ">>> Membongkar APK (JADX)..."
           jadx sofascore.apk -d extracted_source --no-res --show-bad-code --threads-count 4
-          echo "✅ Decompile Finished."
+          echo "✅ Dekompilasi selesai."
 
-      ## 4. SMART SEGMENTATION & MASTER PROMPT
-      - name: Prepare Anti-404 Prompts
+      ## 4. PREPARE ANTI-BLOCK PROMPTS
+      - name: Segmenting Code for Agents
         run: |
           python3 - << 'EOF'
           import os, json
           source_dir = 'extracted_source'
           files_context = []
           
-          # Scan file Java/Kotlin yang berhubungan dengan Network
+          # Scan file Java/Kotlin yang berhubungan dengan Network & Security
           for root, _, files in os.walk(source_dir):
               for file in files:
                   if file.endswith(('.java', '.kt')):
@@ -55,88 +56,105 @@ jobs:
                       try:
                           with open(path, 'r', encoding='utf-8') as f:
                               content = f.read()
-                              # Cari file yang mengandung keyword krusial
-                              if any(k in content for k in ['retrofit', 'OkHttpClient', 'Interceptor', 'X-So-', 'Authorization']):
+                              # Cari file krusial: Retrofit, Interceptor, Auth, GraphQL
+                              keywords = ['retrofit', 'OkHttpClient', 'Interceptor', 'X-So-', 'Authorization', 'graphql']
+                              if any(k in content for k in keywords):
                                   files_context.append({"file": file, "content": content[:7000]})
                       except: continue
 
-          def create_agent_prompt(name, task_focus):
+          def save_prompt(name, focus):
               instruction = (
-                  f"Tugasmu: {task_focus}\n"
-                  "RULES UNTUK 200 OK:\n"
-                  "1. Cari 'HeaderInterceptor' untuk menemukan Header wajib (X-So-Auth, X-App-Version).\n"
-                  "2. Identifikasi Base URL yang aktif (api.sofascore.com/v1 atau /v2).\n"
-                  "3. Gunakan placeholder {{eventId}} atau {{teamId}} daripada menebak angka.\n"
-                  "4. Cari Query Params wajib (?lang=en, ?utcOffset=420).\n"
-                  "OUTPUT: Hanya JSON Array untuk Postman 'item'."
+                  f"FOKUS ANALISIS: {focus}\n"
+                  "INSTRUKSI KERJA:\n"
+                  "1. Cari Base URL dan Endpoint yang valid (api.sofascore.com).\n"
+                  "2. Cari Header wajib (X-So-Auth, X-App-Version, dll) di file Interceptor.\n"
+                  "3. Gunakan placeholder {{eventId}} atau {{teamId}} untuk parameter ID.\n"
+                  "4. Format Output WAJIB dalam JSON array untuk Postman 'item' saja."
               )
-              prompt = {"instruction": instruction, "context": files_context[:25]} # Slice context per agent
+              # Simpan sebagai JSON mentah untuk dikirim via STDIN
               with open(f'prompt_{name}.json', 'w') as f:
-                  json.dump(prompt, f)
+                  json.dump({"prompt": instruction, "context": files_context[:30]}, f)
 
-          # Bagi tugas ke 4 Agent
-          create_agent_prompt("security", "Cari Auth Logic, Header Interceptor, dan API Keys.")
-          create_agent_prompt("matches", "Cari Endpoint Live Score, Lineups, dan Match Detail.")
-          create_agent_prompt("stats", "Cari Endpoint Statistik Pemain, Klasemen, dan Transfer.")
-          create_agent_prompt("gql", "Cari GraphQL Queries dan Mutations di /graphql.")
+          # Bagi menjadi 4 spesialisasi
+          save_prompt("security", "Auth Logic, Header Interceptors, API Keys.")
+          save_prompt("matches", "Live Scores, Match Details, Lineups, Event Info.")
+          save_prompt("stats", "Player Rankings, Team Stats, Transfer Market.")
+          save_prompt("gql", "GraphQL Queries & Schemas at /graphql endpoint.")
           EOF
 
-      ## 5. PARALLEL EXECUTION
-      - name: Run Orchestrator
+      ## 5. EXECUTE AGENTS (Anti-Argument List Too Long Fix)
+      - name: Run Parallel Orchestrator
         run: |
+          # Install OpenCode CLI
           ~/.bun/bin/bun install -g opencode-ai
-          echo ">>> Launching Agents..."
-          ~/.bun/bin/opencode run "$(cat prompt_security.json)" > res_auth.json &
-          ~/.bun/bin/opencode run "$(cat prompt_matches.json)" > res_matches.json &
-          ~/.bun/bin/opencode run "$(cat prompt_stats.json)" > res_stats.json &
-          ~/.bun/bin/opencode run "$(cat prompt_gql.json)" > res_gql.json &
+          
+          echo ">>> Launching Agents via STDIN (Piping)..."
+          # Menggunakan cat dan pipe (|) agar bypass limit karakter CLI Linux
+          cat prompt_security.json | ~/.bun/bin/opencode run > res_auth.json &
+          cat prompt_matches.json  | ~/.bun/bin/opencode run > res_matches.json &
+          cat prompt_stats.json    | ~/.bun/bin/opencode run > res_stats.json &
+          cat prompt_gql.json      | ~/.bun/bin/opencode run > res_gql.json &
+          
           wait
-          echo "✅ Agents work done."
+          echo "✅ All agents finished."
 
-      ## 6. SMART MERGE (FIXING HEADERS)
-      - name: Merge & Fix Collection
+      ## 6. SMART MERGE (Header & Variable Injection)
+      - name: Merge Results & Fix Collection
         run: |
           python3 - << 'EOF'
           import json, re, os
 
           def extract_json_array(filename):
               if not os.path.exists(filename): return []
-              content = open(filename).read()
-              match = re.search(r'\[.*\]', content, re.DOTALL)
-              return json.loads(match.group(0)) if match else []
+              try:
+                  with open(filename, 'r') as f:
+                      content = f.read()
+                  # Cari pola array JSON [ { ... } ]
+                  match = re.search(r'\[\s*\{.*\}\s*\]', content, re.DOTALL)
+                  return json.loads(match.group(0)) if match else []
+              except Exception as e:
+                  print(f"Error parsing {filename}: {e}")
+                  return []
 
           all_items = []
-          for f in ['res_auth.json', 'res_matches.json', 'res_stats.json', 'res_gql.json']:
-              all_items.extend(extract_json_array(f))
+          for res_file in ['res_auth.json', 'res_matches.json', 'res_stats.json', 'res_gql.json']:
+              all_items.extend(extract_json_array(res_file))
 
-          # Tambahkan Header Global ke setiap request agar 200 OK
+          # Injeksi Header Keamanan agar 200 OK
           for item in all_items:
               if 'request' in item:
-                  item['request']['header'] = item['request'].get('header', [])
-                  # Tambahkan header standar Sofascore yang sering diminta
-                  item['request']['header'].append({"key": "User-Agent", "value": "SofascoreAndroid/3.2.1"})
-                  item['request']['header'].append({"key": "X-So-Client", "value": "Android"})
+                  headers = item['request'].get('header', [])
+                  keys = [h['key'].lower() for h in headers]
+                  
+                  # Header Wajib Sofascore agar tidak 403/404
+                  if 'user-agent' not in keys:
+                      headers.append({"key": "User-Agent", "value": "SofascoreAndroid/3.2.1"})
+                  if 'x-so-client' not in keys:
+                      headers.append({"key": "X-So-Client", "value": "Android"})
+                  
+                  item['request']['header'] = headers
 
-          final_collection = {
+          # Template Postman Collection Final
+          postman_final = {
               "info": {
-                  "name": "Sofascore 200-OK Audit",
+                  "name": "Sofascore Audit (200-OK Edition)",
                   "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
               },
               "item": all_items,
               "variable": [
-                  {"key": "baseUrl", "value": "https://api.sofascore.com"},
-                  {"key": "eventId", "value": "1234567"},
-                  {"key": "teamId", "value": "1234"}
+                  {"key": "baseUrl", "value": "https://api.sofascore.com", "type": "string"},
+                  {"key": "eventId", "value": "1234567", "type": "string"},
+                  {"key": "teamId", "value": "1234", "type": "string"}
               ]
           }
 
-          with open('Sofascore_Audit_Result.json', 'w') as f:
-              json.dump(final_collection, f, indent=4)
+          with open('Sofascore_Audit_Report.json', 'w') as f:
+              json.dump(postman_final, f, indent=4)
           EOF
 
-      ## 7. SAVE ARTIFACT
-      - name: Upload Result
+      ## 7. SAVE RESULTS
+      - name: Upload Final Postman Collection
         uses: actions/upload-artifact@v4
         with:
-          name: sofascore-api-audit
-          path: Sofascore_Audit_Result.json
+          name: sofascore-audit-results
+          path: Sofascore_Audit_Report.json
