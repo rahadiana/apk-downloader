@@ -7,54 +7,93 @@ on:
 jobs:
   extract:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Install deps
         run: sudo apt update && sudo apt install -y curl unzip python3
 
-      - name: Download APK
-        run: curl -L -o app.apk https://finance.en.uptodown.com/android/download && file app.apk
-    
+      # -----------------------
+      # 1) Download APK (fail-fast + retry)
+      # -----------------------
+      - name: Download APK (Yahoo Finance)
+        run: |
+          set -e
+
+          URL="https://d.apkpure.com/b/APK/com.yahoo.mobile.client.android.finance"
+          curl -fL --retry 3 --retry-delay 2 -o app.apk "$URL"
+
+          echo "=== APK INFO ==="
+          ls -lh app.apk
+          file app.apk
+
+          # Validasi ukuran minimal (1MB)
+          size=$(stat -c%s app.apk)
+          if [ "$size" -lt 1000000 ]; then
+            echo "APK tidak valid / terlalu kecil"
+            exit 1
+          fi
+
+          # Validasi zip signature
+          file app.apk | grep -q "Zip archive" || (echo "Bukan APK valid" && exit 1)
+
+      # -----------------------
+      # 2) Install JADX (stable URL)
+      # -----------------------
       - name: Install JADX
         run: |
           set -e
-      
+
           URL="https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip"
-      
-          echo "Downloading JADX..."
           curl -fL --retry 3 --retry-delay 2 -o jadx.zip "$URL"
-      
-          echo "=== CHECK FILE ==="
+
           ls -lh jadx.zip
           file jadx.zip
-      
-          # validasi file (harus zip + >5MB)
-          file jadx.zip | grep -q "Zip archive" || (echo "Bukan zip" && exit 1)
-          [ $(stat -c%s jadx.zip) -gt 5000000 ] || (echo "File terlalu kecil" && exit 1)
-      
+
+          size=$(stat -c%s jadx.zip)
+          if [ "$size" -lt 5000000 ]; then
+            echo "Download JADX gagal"
+            exit 1
+          fi
+
           unzip -q jadx.zip
-      
-          echo "=== CONTENT ==="
+
+          echo "=== JADX CONTENT ==="
           ls -lah
-      
-          # pastikan binary ada
-          test -f jadx-1.5.0/bin/jadx || (echo "jadx tidak ditemukan" && exit 1)
-      
+
+          test -f bin/jadx || (echo "jadx binary tidak ditemukan" && exit 1)
+          chmod +x bin/jadx
+
+      # -----------------------
+      # 3) Decompile
+      # -----------------------
       - name: Decompile APK
         run: |
           set -e
-      
-          ./jadx-1.5.0/bin/jadx -d out app.apk
-      
-          echo "=== RESULT ==="
+          ./bin/jadx -d out app.apk
+          echo "=== OUT DIR ==="
           ls -lah out
 
+      # -----------------------
+      # 4) Extract endpoints
+      # -----------------------
       - name: Extract endpoints
-        run: grep -RhoE "https?://[^\" ]+" out | sort -u > urls.txt || true
+        run: |
+          grep -RhoE "https?://[^\" ]+" out | sort -u > urls.txt || true
+          echo "TOTAL URL:"
+          wc -l urls.txt
+          head -n 50 urls.txt
 
+      # -----------------------
+      # 5) Convert to JSON
+      # -----------------------
       - name: Convert to JSON
-        run: python3 -c "import json; print(json.dumps({'urls':[l.strip() for l in open('urls.txt')]}))" > endpoints.json
+        run: |
+          python3 -c "import json; print(json.dumps({'urls':[l.strip() for l in open('urls.txt')]}))" > endpoints.json
 
+      # -----------------------
+      # 6) Upload result
+      # -----------------------
       - name: Upload result
         uses: actions/upload-artifact@v4
         with:
