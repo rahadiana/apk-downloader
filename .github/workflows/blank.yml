@@ -1,4 +1,4 @@
-name: Universal AI APK Auditor - Elite Orchestrator
+name: Universal AI APK Auditor - Elite Researcher Edition
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
         default: 'https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk'
 
 jobs:
-  universal-audit:
+  elite-audit:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -23,7 +23,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y wget unzip python3 python3-pip jq curl
-          # JADX Decompiler
+          # JADX
           wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
@@ -31,40 +31,32 @@ jobs:
           curl -fsSL https://bun.sh/install | bash
           echo "$HOME/.bun/bin" >> $GITHUB_PATH
 
-      ## 2. DYNAMIC FETCH APK (ANTI-ERROR LOGIC)
-      - name: Download Target APK
+      ## 2. FETCH APK (DENGAN PROTEKSI ERROR)
+      - name: Download APK
         run: |
-          # Gunakan input dari manual trigger, jika kosong pakai default
           APK_URL="${{ github.event.inputs.apk_url }}"
-          if [ -z "$APK_URL" ]; then
-            APK_URL="https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk"
-          fi
+          [ -z "$APK_URL" ] && APK_URL="https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk"
           
-          echo ">>> Fetching APK dari: $APK_URL"
-          curl -L -f -o target_app.apk "$APK_URL" || { echo "❌ Download Gagal! Pastikan Link Direct."; exit 1; }
-          echo "✅ APK Terunduh: $(ls -lh target_app.apk | awk '{print $5}')"
+          echo ">>> Downloading from: $APK_URL"
+          curl -L -f -o target.apk "$APK_URL" || { echo "❌ Link Mati atau Bukan Direct Link!"; exit 1; }
+          echo "✅ APK Berhasil Diunduh."
 
-      ## 3. UNIVERSAL DECOMPILE
-      - name: Decompile Source Code
+      ## 3. DECOMPILE (DEEP SCAN)
+      - name: Decompile Source
         run: |
-          echo ">>> Membongkar APK... (Mungkin butuh beberapa menit)"
-          jadx target_app.apk -d extracted_source --no-res --show-bad-code --threads-count 4
+          jadx target.apk -d extracted_source --no-res --show-bad-code --threads-count 4
           echo "✅ Dekompilasi Selesai."
 
-      ## 4. HEURISTIC CONTEXT EXTRACTION
-      - name: Smart Context Filtering
+      ## 4. SMART FILTERING (MENGUMPULKAN DATA TERBAIK)
+      - name: Extract Networking Context
         run: |
           python3 - << 'EOF'
           import os, json
           source_dir = 'extracted_source'
-          files_context = []
+          context_files = []
           
-          # Heuristic patterns untuk mendeteksi API & Networking di app apapun
-          patterns = [
-              'retrofit', 'okhttp', 'httpclient', 'interceptor', 
-              'authorization', 'bearer', 'api_key', 'graphql', 
-              'firebase', '@GET', '@POST', 'hostname', 'client_id'
-          ]
+          # Cari file yang PALING PENTING (Networking & Security)
+          patterns = ['retrofit', 'okhttp', 'interceptor', 'authorization', 'api_key', 'graphql', '@GET', '@POST']
           
           for root, _, files in os.walk(source_dir):
               for file in files:
@@ -74,90 +66,72 @@ jobs:
                           with open(path, 'r', encoding='utf-8') as f:
                               content = f.read()
                               if any(k in content.lower() for k in patterns):
-                                  # Ambil 7000 karakter pertama sebagai konteks
-                                  files_context.append({"file": file, "content": content[:7000]})
+                                  # Ambil file krusial (limit 50 file terbaik agar context tidak overload)
+                                  context_files.append({"file": file, "content": content[:8000]})
                       except: continue
 
-          # Urutkan berdasarkan kepadatan keyword agar AI dapet file yang paling 'daging'
-          files_context.sort(key=lambda x: sum(p in x['content'].lower() for p in patterns), reverse=True)
-
-          def save_p(name, focus):
-              with open(f'prompt_{name}.json', 'w') as f:
-                  json.dump({"focus": focus, "context": files_context[:30]}, f)
-
-          save_p("security", "Cari Auth Logic, Header Interceptor, API Keys, dan Token handling.")
-          save_p("explorer", "Cari Core API Endpoints, Business Logic, dan Data Retrieval.")
-          save_p("database", "Cari Firebase, GraphQL, dan Background Sync endpoints.")
-          save_p("params", "Cari Query Parameters dan struktur POST Body (JSON).")
+          # Sort berdasarkan jumlah keyword terbanyak (file paling 'daging')
+          context_files.sort(key=lambda x: sum(p in x['content'].lower() for p in patterns), reverse=True)
+          
+          # Simpan prompt tunggal yang super detail
+          prompt = {
+              "instruction": (
+                  "Kamu adalah Senior Reverse Engineer & Security Auditor.\n"
+                  "ANALISIS DATA BERIKUT SECARA MENDALAM:\n"
+                  "1. Temukan Base URL utama dan semua endpoint API yang tersedia.\n"
+                  "2. IDENTIFIKASI SECURITY: Cari header wajib (X-Api-Key, Authorization, User-Agent, dll) di file Interceptor.\n"
+                  "3. STRUKTURKAN: Buat Postman Collection V2.1 dengan FOLDER yang rapi (misal: Auth, Content, User, Stats).\n"
+                  "4. VARIABEL: Gunakan {{baseUrl}} dan gantilah ID/Token statis menjadi variabel seperti {{id}}.\n"
+                  "5. OUTPUT: Hanya JSON Postman Collection yang valid tanpa penjelasan teks apapun."
+              ),
+              "context": context_files[:45] # 45 file paling relevan
+          }
+          
+          with open('elite_prompt.json', 'w') as f:
+              json.dump(prompt, f)
           EOF
 
-      ## 5. STAGE 1: PARALLEL DISCOVERY
-      - name: Stage 1 - Parallel Scanning
+      ## 5. THE ELITE RESEARCHER EXECUTION (SINGLE AGENT)
+      - name: Run Elite Researcher Agent
         run: |
           ~/.bun/bin/bun install -g opencode-ai
-          echo ">>> 4 Agent sedang bekerja secara paralel..."
-          cat prompt_security.json | ~/.bun/bin/opencode run > raw_sec.json &
-          cat prompt_explorer.json | ~/.bun/bin/opencode run > raw_core.json &
-          cat prompt_database.json | ~/.bun/bin/opencode run > raw_db.json &
-          cat prompt_params.json   | ~/.bun/bin/opencode run > raw_params.json &
-          wait
-          echo "✅ Scanning selesai."
+          echo ">>> Sedang menganalisis secara mendalam (Single Agent Mode)..."
+          # Menggunakan piping untuk menghindari 'Argument list too long'
+          cat elite_prompt.json | ~/.bun/bin/opencode run > raw_result.json
+          echo "✅ Analisis selesai."
 
-      ## 6. STAGE 2: THE CONSOLIDATOR (MANAGER AGENT)
-      - name: Stage 2 - Orchestrating & Grouping
-        run: |
-          python3 - << 'EOF'
-          import json
-          raw_data = {}
-          for f in ['raw_sec.json', 'raw_core.json', 'raw_db.json', 'raw_params.json']:
-              try:
-                  with open(f, 'r') as s: raw_data[f] = s.read()
-              except: pass
-          
-          final_instruction = (
-              "Kamu adalah Expert Reverse Engineer. Gabungkan hasil temuan mentah ini.\n"
-              "TUGAS UTAMA:\n"
-              "1. IDENTIFIKASI NAMA APLIKASI: Tebak dari kode (misal: Sofascore, Gojek, dll).\n"
-              "2. FOLDERIZE: Kelompokkan request ke folder (Auth, User Data, Feature A, Feature B).\n"
-              "3. VARIABLE SYNC: Gunakan {{baseUrl}} untuk host dan {{id}} untuk parameter dinamis.\n"
-              "4. GLOBAL HEADERS: Terapkan Header wajib (seperti User-Agent atau Auth) ke semua request.\n"
-              "5. OUTPUT: Berikan satu JSON Postman Collection V2.1 yang utuh dan rapi."
-          )
-          with open('final_boss_prompt.json', 'w') as f:
-              json.dump({"instruction": final_instruction, "raw_data": raw_data}, f)
-          EOF
-
-          echo ">>> Manager Agent sedang menyusun struktur Postman..."
-          cat final_boss_prompt.json | ~/.bun/bin/opencode run > raw_final.json
-
-      ## 7. FINAL POLISH & VALIDATION
+      ## 6. FINAL CLEANUP & INJECTION
       - name: Final Polish
         run: |
           python3 - << 'EOF'
           import json, re, os
           try:
-              raw = open('raw_final.json').read()
-              match = re.search(r'(\{.*\})', raw, re.DOTALL)
+              raw_content = open('raw_result.json').read()
+              # Ekstrak hanya bagian JSON-nya saja
+              match = re.search(r'(\{.*\})', raw_content, re.DOTALL)
               if match:
                   data = json.loads(match.group(1))
-                  # Injeksi Variable default jika belum ada
+                  
+                  # Pastikan variabel global ada
                   if 'variable' not in data: data['variable'] = []
-                  
-                  # Cek apakah baseUrl sudah ada
                   keys = [v['key'] for v in data['variable']]
-                  if 'baseUrl' not in keys:
-                      data['variable'].append({"key": "baseUrl", "value": "https://api.example.com", "type": "string"})
                   
-                  with open('Universal_Audit_Result.json', 'w') as f:
+                  # Injeksi baseUrl default jika AI lupa
+                  if 'baseUrl' not in keys:
+                      data['variable'].append({"key": "baseUrl", "value": "https://api.change-me.com", "type": "string"})
+                  
+                  with open('Elite_API_Audit.json', 'w') as f:
                       json.dump(data, f, indent=4)
-                  print("✅ Postman Collection berhasil dibuat!")
+                  print("✅ Postman Collection Berhasil Dibuat!")
+              else:
+                  print("❌ AI tidak memberikan format JSON yang valid.")
           except Exception as e:
-              print(f"❌ Gagal memproses hasil final: {e}")
+              print(f"❌ Error Final: {e}")
           EOF
 
-      ## 8. ARTIFACTS
-      - name: Upload Final Audit
+      ## 7. SAVE ARTIFACT
+      - name: Upload Elite Audit
         uses: actions/upload-artifact@v4
         with:
-          name: universal-api-audit
-          path: Universal_Audit_Result.json
+          name: elite-api-audit
+          path: Elite_API_Audit.json
