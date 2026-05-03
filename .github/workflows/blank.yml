@@ -1,4 +1,4 @@
-name: AI APK Auditor - Robust Web Navigation
+name: AI APK Auditor - Fixed Web Navigation
 
 on:
   push:
@@ -23,7 +23,7 @@ jobs:
           pip install playwright
           playwright install chromium --with-deps
 
-      - name: Download APK via Evozi Navigation
+      - name: Download APK via APK-DL (Force Mode)
         run: |
           python3 - << 'EOF'
           import asyncio
@@ -31,39 +31,40 @@ jobs:
 
           async def run():
               async with async_playwright() as p:
-                  # Gunakan User Agent asli agar tidak terdeteksi bot
                   browser = await p.chromium.launch(headless=True)
+                  # Gunakan User Agent Mobile agar website lebih ringan
                   context = await browser.new_context(
-                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+                      user_agent="Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.162 Mobile Safari/537.36"
                   )
                   page = await context.new_page()
                   
-                  print(">>> Membuka Downloader...")
+                  print(">>> Membuka Downloader APK-DL...")
                   try:
-                      # Gunakan situs APK-DL atau Evozi yang lebih simpel
-                      await page.goto("https://apps.evozi.com/apk-downloader/", timeout=60000)
+                      # Navigasi langsung ke halaman package Tribunnews
+                      target_url = "https://apk-dl.com/tribunnews-indonesia-local-news/mobile.android.tribun"
+                      await page.goto(target_url, timeout=60000)
                       
-                      # Masukkan Package ID
-                      await page.fill("#packagename", "mobile.android.tribun")
-                      print(">>> Generate Download Link...")
-                      await page.click("button[name='generate']")
+                      print(">>> Mencari tombol download...")
+                      # Tunggu tombol yang mengarah ke halaman download
+                      download_page_selector = "a.download-btn"
+                      await page.wait_for_selector(download_page_selector)
+                      await page.click(download_page_selector)
+
+                      # Tunggu tombol generate/final download
+                      final_btn = "a.mdl-button--colored"
+                      await page.wait_for_selector(final_btn, timeout=60000)
                       
-                      # Tunggu tombol download muncul (bisa butuh waktu)
-                      download_btn_selector = "a.btn-success"
-                      await page.wait_for_selector(download_btn_selector, timeout=60000)
-                      
-                      print(">>> Memulai Download...")
+                      print(">>> Mengunduh file...")
                       async with page.expect_download() as download_info:
-                          await page.click(download_btn_selector)
+                          await page.click(final_btn)
                       
                       download = await download_info.value
                       await download.save_as("tribun.apk")
-                      print(f"✅ Berhasil: tribun.apk")
+                      print(f"✅ Berhasil mengunduh APK!")
                       
                   except Exception as e:
-                      print(f"❌ Navigasi Gagal: {e}")
-                      # Screenshot untuk debugging jika gagal
-                      await page.screenshot(path="debug_screen.png")
+                      print(f"❌ Gagal di tengah jalan: {e}")
+                      await page.screenshot(path="error_debug.png")
                       raise e
                   finally:
                       await browser.close()
@@ -88,14 +89,15 @@ jobs:
                       try:
                           with open(path, 'r', encoding='utf-8') as f:
                               content = f.read()
-                              if any(k in content for k in ['tribun', 'api', 'retrofit']):
+                              # Cari pola API Tribun secara spesifik
+                              if any(k in content for k in ['tribun', 'api', 'retrofit', 'endpoint']):
                                   context["api_logic"].append({"file": file, "snippet": content[:8000]})
                       except: continue
           with open('ai_input.json', 'w') as f:
               json.dump(context, f, indent=2)
           EOF
 
-      - name: Setup Bun & AI
+      - name: Setup Bun & AI Runner
         uses: oven-sh/setup-bun@v1
         with:
           bun-version: latest
@@ -105,7 +107,7 @@ jobs:
           bun install -g opencode-ai
           python3 -c "
           ctx = open('ai_input.json').read()
-          prompt = f'Analisis API Tribunnews dari kode ini. Buat Postman Collection V2.1 JSON Murni:\n{ctx[:30000]}'
+          prompt = f'Analisis endpoint API dari kode Tribunnews ini. Berikan output Postman Collection V2.1 dalam JSON murni:\n{ctx[:30000]}'
           open('prompt.txt', 'w').write(prompt)
           "
           opencode run "$(cat prompt.txt)" > raw_output.json
@@ -119,18 +121,18 @@ jobs:
               match = re.search(r'(\{.*\})', content, re.DOTALL)
               if match:
                   data = json.loads(match.group(1))
-                  with open('Tribunnews_Audit.json', 'w') as f:
+                  with open('Tribun_Audit_Report.json', 'w') as f:
                       json.dump(data, f, indent=4)
-                  print("✅ Postman Collection siap!")
+                  print("✅ Berhasil! File Postman siap.")
               else: sys.exit(1)
           except: sys.exit(1)
           EOF
 
-      - name: Upload Artifacts
+      - name: Save Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tribun-api-results
+          name: api-audit-tribun
           path: |
-            Tribunnews_Audit.json
-            debug_screen.png
+            Tribun_Audit_Report.json
+            error_debug.png
