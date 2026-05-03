@@ -15,16 +15,22 @@ jobs:
       - name: Download APK
         run: curl -L -o app.apk https://finance.en.uptodown.com/android/download && file app.apk
 
-      - name: Install JADX (dynamic)
+      - name: Install JADX (dynamic safe)
         run: |
           set -e
       
-          URL=$(curl -s https://api.github.com/repos/skylot/jadx/releases/latest \
-            | grep browser_download_url \
-            | grep linux \
-            | cut -d '"' -f 4)
+          sudo apt update && sudo apt install -y jq
       
-          echo "Downloading: $URL"
+          URL=$(curl -s https://api.github.com/repos/skylot/jadx/releases/latest \
+            | jq -r '.assets[] | select(.name | test("jadx-.*\\.zip")) | .browser_download_url' \
+            | head -n 1)
+      
+          echo "URL = $URL"
+      
+          if [ -z "$URL" ]; then
+            echo "Gagal ambil URL dari GitHub API"
+            exit 1
+          fi
       
           curl -fL --retry 3 -o jadx.zip "$URL"
       
