@@ -16,26 +16,34 @@ jobs:
           sudo apt update
           sudo apt install -y wget unzip curl openjdk-17-jdk
 
+      # =========================
+      # Setup Android SDK (FIXED)
+      # =========================
       - name: Setup Android SDK
         run: |
           mkdir -p $HOME/android-sdk
           cd $HOME/android-sdk
-      
+
           wget https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           unzip commandlinetools-linux-*.zip -d tmp
-      
+
           mkdir -p cmdline-tools/latest
           mv tmp/cmdline-tools/* cmdline-tools/latest/
-      
+
           echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
           echo "PATH=$PATH:$HOME/android-sdk/cmdline-tools/latest/bin:$HOME/android-sdk/platform-tools:$HOME/android-sdk/emulator" >> $GITHUB_ENV
 
-      - name: Export PATH
+      # =========================
+      # Set AVD Path (IMPORTANT)
+      # =========================
+      - name: Set AVD path
         run: |
-          export ANDROID_HOME=$HOME/android-sdk
-          export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator
-          echo $PATH
+          mkdir -p $HOME/.android/avd
+          echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
 
+      # =========================
+      # Install SDK + System Image
+      # =========================
       - name: Install SDK packages
         run: |
           yes | sdkmanager --licenses
@@ -45,22 +53,53 @@ jobs:
             "platforms;android-30" \
             "system-images;android-30;google_apis;x86_64"
 
+      # =========================
+      # Create AVD (DEBUG SAFE)
+      # =========================
       - name: Create AVD
         run: |
-          echo "no" | avdmanager create avd -n test -k "system-images;android-30;google_apis;x86_64" --force
+          echo "no" | avdmanager create avd \
+            -n test \
+            -k "system-images;android-30;google_apis;x86_64" \
+            --force
 
+          echo "=== LIST AVD ==="
+          emulator -list-avds
+
+          echo "=== AVD DIR ==="
+          ls -lah $HOME/.android/avd
+
+      # =========================
+      # Start Emulator (FIXED)
+      # =========================
       - name: Start emulator
         run: |
-          nohup emulator -avd test -no-window -no-audio -no-boot-anim -gpu off &
+          emulator -list-avds
+
+          nohup emulator @test \
+            -no-window \
+            -no-audio \
+            -no-boot-anim \
+            -gpu off \
+            -accel off \
+            -no-snapshot \
+            > emulator.log 2>&1 &
+
           adb wait-for-device
 
+      # =========================
+      # Wait boot complete
+      # =========================
       - name: Wait boot complete
         run: |
           adb wait-for-device
           adb shell 'while [[ "$(getprop sys.boot_completed)" != "1" ]]; do sleep 2; done'
           adb shell input keyevent 82
 
-      - name: Download APK (fallback source)
+      # =========================
+      # Download APK
+      # =========================
+      - name: Download APK
         run: |
           wget --content-disposition -O app.apk "https://finance.en.uptodown.com/android/download"
 
@@ -68,14 +107,23 @@ jobs:
           file app.apk
           ls -lh
 
+      # =========================
+      # Install APK
+      # =========================
       - name: Install APK
         run: |
           adb install -r app.apk
 
+      # =========================
+      # Dump APK path
+      # =========================
       - name: Dump APK path
         run: |
           adb shell pm path com.yahoo.mobile.client.android.finance
 
+      # =========================
+      # Pull APK(s)
+      # =========================
       - name: Pull APK(s)
         run: |
           pkg="com.yahoo.mobile.client.android.finance"
@@ -83,10 +131,16 @@ jobs:
             adb pull "$line"
           done
 
+      # =========================
+      # Debug output
+      # =========================
       - name: List dumped files
         run: |
           ls -lah
 
+      # =========================
+      # Upload result
+      # =========================
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
