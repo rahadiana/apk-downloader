@@ -1,4 +1,4 @@
-name: Ultimate AI APK Security Auditor & Postman Generator
+name: AI APK Auditor - Auto Web Navigation Mode
 
 on:
   push:
@@ -6,49 +6,73 @@ on:
   workflow_dispatch:
 
 jobs:
-  audit-and-test:
+  audit-process:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
 
-      ## 1. SETUP ENVIRONMENT & TOOLS
-      - name: Install Forensic Tools (JADX & Python)
+      ## 1. SETUP TOOLS & BROWSER
+      - name: Install Forensic Tools & Playwright
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y wget unzip python3 python3-pip curl jq
-          # Install JADX Decompiler
+          sudo apt-get install -y wget unzip python3 python3-pip jq
+          # Install JADX
           wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
-          # Install Python Dependencies
-          pip install pandas requests --quiet
+          # Setup Playwright untuk navigasi web
+          pip install playwright
+          playwright install chromium --with-deps
 
-      - name: Setup Bun & Opencode
-        uses: oven-sh/setup-bun@v1
-        with:
-          bun-version: latest
-
-      - name: Install AI Engine
+      ## 2. NAVIGASI WEB OTOMATIS (DOWNLOAD APK)
+      - name: Download APK via Web Navigation
         run: |
-          bun install -g opencode-ai
-          sleep 5
+          python3 - << 'EOF'
+          import asyncio
+          from playwright.async_api import async_playwright
 
-      ## 2. EKSTRAKSI & DEKOMPILASI
-      - name: Download & Decompile APK
+          async def run():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  page = await browser.new_page()
+                  
+                  # Navigasi ke situs penyedia APK (Contoh: APKCombo atau sejenisnya)
+                  print("Navigasi ke downloader...")
+                  # Kita gunakan link direct generator agar lebih stabil
+                  target_url = "https://apkpure.com/id/tribunnews-indonesia-local-news/mobile.android.tribun/download"
+                  
+                  await page.goto(target_url, wait_until="networkidle")
+                  
+                  # Klik tombol download (Selector ini mungkin perlu disesuaikan jika web berubah)
+                  print("Mencari tombol download...")
+                  async with page.expect_download() as download_info:
+                      # Mencari link yang mengandung .apk
+                      await page.click("a.download-start-btn") 
+                  
+                  download = await download_info.value
+                  await download.save_as("tribun.apk")
+                  print(f"✅ Berhasil mendownload: {download.suggested_filename}")
+                  await browser.close()
+
+          asyncio.run(run())
+          EOF
+
+      ## 3. DECOMPILE (BONGKAR KODE)
+      - name: Decompile Source Code
         run: |
-          curl -fL --retry 3 -o target.apk "https://raw.githubusercontent.com/rahadiana/apk-downloader/refs/heads/main/ini.apk"
-          jadx target.apk -d extracted_source --no-res --show-bad-code
+          jadx tribun.apk -d extracted_source --no-res --show-bad-code --threads-count 4
           echo "✅ Dekompilasi selesai."
 
-      ## 3. PRE-PROCESSING (KONTEKS)
-      - name: Build AI Context Map
+      ## 4. EKSTRAKSI KONTEKS UNTUK AI
+      - name: Build AI Context
         run: |
           python3 - << 'EOF'
           import os, re, json
           source_dir = 'extracted_source'
-          context = {"api_logic": [], "hardcoded_secrets": [], "network_files": []}
+          context = {"api_logic": [], "hardcoded_secrets": []}
+          
           for root, _, files in os.walk(source_dir):
               for file in files:
                   if file.endswith(('.java', '.kt')):
@@ -56,107 +80,52 @@ jobs:
                       try:
                           with open(path, 'r', encoding='utf-8') as f:
                               content = f.read()
-                              if any(k in content for k in ['Retrofit', 'OkHttp', 'HttpURLConnection', 'URL']):
-                                  context["api_logic"].append({"file": file, "snippet": content[:7000]})
-                              keys = re.findall(r'(?i)(api[_-]key|secret|token|auth).*?["\']([a-zA-Z0-9_\-\.]{10,})["\']', content)
-                              if keys: context["hardcoded_secrets"].append({"file": file, "findings": keys})
+                              if any(k in content for k in ['tribunnews', 'api', 'retrofit', 'endpoint']):
+                                  context["api_logic"].append({
+                                      "file": file,
+                                      "snippet": content[:8000]
+                                  })
                       except: continue
-          with open('ai_input_context.json', 'w') as f:
+          
+          with open('ai_input.json', 'w') as f:
               json.dump(context, f, indent=2)
           EOF
 
-      ## 4. AI ROUND 1: MAPPING
-      - name: AI Round 1 - Architecture Mapping
-        run: |
-          python3 -c "
-          import json
-          ctx = open('ai_input_context.json').read()
-          prompt = f'Analisis source code APK ini secara teliti. Identifikasi Base URL, Endpoint, dan Auth Mechanism. OUTPUT WAJIB JSON MURNI:\n{ctx[:30000]}'
-          open('prompt_r1.txt', 'w').write(prompt)
-          "
-          opencode run "$(cat prompt_r1.txt)" > mapping_report.json
+      ## 5. ANALISIS AI & GENERATE POSTMAN
+      - name: Setup Bun & AI
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
 
-      ## 5. AI ROUND 2: GENERATE TEST CASES
-      - name: AI Round 2 - Generate Test Cases
+      - name: AI Audit
         run: |
+          bun install -g opencode-ai
           python3 -c "
-          mapping = open('mapping_report.json').read()
-          prompt = f'Buat daftar curl command untuk testing endpoint ini: {mapping}. Output JSON: {{\"test_cases\": []}}'
-          open('prompt_r2.txt', 'w').write(prompt)
+          ctx = open('ai_input.json').read()
+          prompt = f'Kamu adalah expert API security. Dari kode APK Tribunnews ini, temukan Base URL dan semua endpoint berita. Buat Postman Collection V2.1 JSON Murni:\n{ctx[:30000]}'
+          open('prompt.txt', 'w').write(prompt)
           "
-          opencode run "$(cat prompt_r2.txt)" > test_cases_raw.txt
-          
-          # Fix JSON format for test_cases
-          python3 -c "
-          import re, json
-          raw = open('test_cases_raw.txt').read()
-          match = re.search(r'\{.*\}', raw, re.DOTALL)
-          if match:
-              with open('test_cases.json', 'w') as f:
-                  f.write(match.group())
-          "
+          opencode run "$(cat prompt.txt)" > raw_output.json
 
-      ## 6. EKSEKUSI PENGUJIAN
-      - name: Execute Live API Tests
+      ## 6. CLEANUP & SAVE POSTMAN JSON
+      - name: Finalize Postman Collection
         run: |
-          python3 - << 'PYEOF'
-          import json, subprocess, os
-          results = []
-          if os.path.exists('test_cases.json'):
-              try:
-                  with open('test_cases.json') as f:
-                      data = json.load(f)
-                      cases = data.get('test_cases', [])
-                      for case in cases:
-                          cmd = case.get('curl_command')
-                          if cmd and "[TOKEN]" not in cmd:
-                              print(f"Testing: {case.get('name')}")
-                              res = subprocess.run(cmd + " -s -w ' %{http_code}'", shell=True, capture_output=True, text=True)
-                              results.append({"name": case.get('name'), "output": res.stdout})
-              except Exception as e: print(f"Error executing: {e}")
-          with open('test_results.json', 'w') as f:
-              json.dump(results, f)
-          PYEOF
-
-      ## 7. AI ROUND 3: POSTMAN GENERATOR (FIXED)
-      - name: AI Round 3 - Postman Collection Generator
-        run: |
-          python3 -c "
-          mapping = open('mapping_report.json').read()
-          prompt = f'Ubah data API ini menjadi Postman Collection V2.1 JSON MURNI. Gunakan variabel {{{{baseUrl}}}}. Kelompokkan berdasarkan fungsionalitas. DATA:\n{mapping}'
-          open('prompt_postman.txt', 'w').write(prompt)
-          "
-          opencode run "$(cat prompt_postman.txt)" > raw_postman.json
-          
-          # Robust Extraction for Postman JSON
           python3 - << 'EOF'
           import re, json, sys
           try:
-              with open('raw_postman.json', 'r') as f:
-                  raw_content = f.read()
-              # Mencari struktur JSON terdalam/terluar yang valid
-              match = re.search(r'(\{.*\})', raw_content, re.DOTALL)
+              content = open('raw_output.json').read()
+              match = re.search(r'(\{.*\})', content, re.DOTALL)
               if match:
-                  json_str = match.group(1)
-                  # Validasi JSON
-                  parsed_data = json.loads(json_str)
-                  with open('APK_Audit_Collection.json', 'w') as f:
-                      json.dump(parsed_data, f, indent=4)
-                  print("✅ Postman Collection validated successfully.")
-              else:
-                  print("❌ JSON block not found in AI output.")
-                  sys.exit(1)
-          except Exception as e:
-              print(f"❌ Critical Error parsing Postman JSON: {e}")
-              sys.exit(1)
+                  data = json.loads(match.group(1))
+                  with open('Tribunnews_Audit.postman_collection.json', 'w') as f:
+                      json.dump(data, f, indent=4)
+                  print("✅ Postman Collection berhasil dibuat!")
+              else: sys.exit(1)
+          except: sys.exit(1)
           EOF
 
-      ## 8. ARTIFACTS
-      - name: Upload Results
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: final-api-audit-package
-          path: |
-            APK_Audit_Collection.json
-            mapping_report.json
-            test_results.json
+          name: tribun-api-results
+          path: Tribunnews_Audit.postman_collection.json
