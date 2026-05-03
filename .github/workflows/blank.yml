@@ -28,47 +28,20 @@ jobs:
       - name: Download APK
         run: |
           set -e
-
-          # Install apkeep
-          curl -fsSL https://github.com/EFForg/apkeep/releases/download/0.17.0/apkeep-x86_64-unknown-linux-gnu \
-            -o apkeep
-          chmod +x apkeep
-
-          # Download dari Google Play (tanpa login, public APK)
-          ./apkeep -a com.yahoo.mobile.client.android.finance .
-
-          # Cari file APK yang didownload
-          APK_FILE=$(find . -name "*.apk" | head -1)
-          if [ -z "$APK_FILE" ]; then
-            echo "❌ APK tidak ditemukan"
+          PKG="com.yahoo.mobile.client.android.finance"
+      
+          # Ambil link download dari APKCombo
+          DL_PAGE=$(curl -fsSL "https://apkcombo.com/yahoo-finance/com.yahoo.mobile.client.android.finance/download/apk")
+          APK_URL=$(echo "$DL_PAGE" | grep -oE 'https://[^"]+\.apk[^"]*' | head -1)
+      
+          if [ -z "$APK_URL" ]; then
+            echo "❌ URL tidak ditemukan"
             exit 1
           fi
-
-          mv "$APK_FILE" app.apk
-
-          echo "=== APK INFO ==="
+      
+          echo "Downloading: $APK_URL"
+          curl -fL -A "Mozilla/5.0" -o app.apk "$APK_URL"
           ls -lh app.apk
-          file app.apk
-
-          # Validasi
-          size=$(stat -c%s app.apk)
-          echo "Ukuran: $size bytes"
-          if [ "$size" -lt 1000000 ]; then
-            echo "❌ APK terlalu kecil / tidak valid"
-            exit 1
-          fi
-
-          file app.apk | grep -q "Zip archive" || {
-            echo "❌ Bukan ZIP/APK valid"
-            exit 1
-          }
-
-          unzip -l app.apk | grep -q "classes.dex" || {
-            echo "❌ APK tidak punya classes.dex"
-            exit 1
-          }
-
-          echo "✅ APK valid"
 
       # -----------------------
       # 3) Install JADX
