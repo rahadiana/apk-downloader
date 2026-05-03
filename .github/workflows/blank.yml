@@ -1,4 +1,4 @@
-name: Extract API from APK
+name: Extract & Test API from APK (AI-powered)
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 jobs:
   extract:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -16,20 +16,23 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y unzip python3 default-jre-headless
+          sudo apt-get install -y unzip python3 default-jre-headless curl
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install opencode
+        run: |
+          bun install -g opencode-ai
+          sleep 5
 
       - name: Download APK
         run: |
           curl -fL --retry 3 \
             -o app.apk \
             "https://raw.githubusercontent.com/rahadiana/apk-downloader/refs/heads/main/ini.apk"
-
-          echo "=== DEBUG ==="
-          ls -lh app.apk
-          file app.apk
-          xxd app.apk | head -2
-
-          # Validasi pakai unzip langsung, bukan file command
           unzip -t app.apk > /dev/null 2>&1 || { echo "❌ Tidak bisa di-unzip"; exit 1; }
           unzip -l app.apk | grep -q "classes.dex" || { echo "❌ Tidak ada dex"; exit 1; }
           echo "✅ APK valid"
@@ -45,53 +48,208 @@ jobs:
         run: |
           mkdir -p out
           export JAVA_OPTS="-Xmx4g"
-          jadx-dist/bin/jadx --threads-count 4 --no-res -d out app.apk || true  # ← tambah || true
+          jadx-dist/bin/jadx --threads-count 4 --no-res -d out app.apk || true
+          echo "Total .java: $(find out -name '*.java' | wc -l)"
 
-          JAVA_COUNT=$(find out -name '*.java' | wc -l)
-          echo "Total .java: $JAVA_COUNT"
-          if [ "$JAVA_COUNT" -lt 100 ]; then
-            echo "❌ Output terlalu sedikit, kemungkinan gagal"
-            exit 1
-          fi
-          echo "✅ Decompile selesai"
-
-      - name: Extract endpoints
+      # Kumpulkan file Java yang paling relevan untuk AI
+      - name: Prepare context for AI
         run: |
-          grep -RhoE 'https?://[^"'\'' \t\n\r<>{}|\\^`]+' out/ \
-            | grep -vE '(schemas\.android\.com|w3\.org|apache\.org|xmlns|example\.com)' \
-            | sort -u > urls.txt || true
-          echo "Total URL: $(wc -l < urls.txt)"
-          head -50 urls.txt
+          mkdir -p ai_input
 
-      - name: Convert to JSON
+          # Cari file yang kemungkinan besar berisi API calls
+          # (Retrofit, OkHttp, Volley, URL, HttpURLConnection, @GET, @POST, @PUT)
+          grep -rl \
+            -e "Retrofit\|OkHttp\|@GET\|@POST\|@PUT\|@DELETE\|@PATCH\|BaseUrl\|BASE_URL\|HttpUrl\|buildUpon\|addPathSegment" \
+            out/ 2>/dev/null \
+            | head -30 > ai_input/relevant_files.txt
+
+          echo "=== File relevan ditemukan: $(wc -l < ai_input/relevant_files.txt) ==="
+          cat ai_input/relevant_files.txt
+
+          # Gabungkan isi file-file itu (max 50k chars biar tidak overflow)
+          while IFS= read -r f; do
+            echo "=== FILE: $f ===" >> ai_input/code_context.txt
+            cat "$f" >> ai_input/code_context.txt
+            echo "" >> ai_input/code_context.txt
+          done < ai_input/relevant_files.txt
+
+          # Potong kalau terlalu panjang
+          python3 -c "
+          content = open('ai_input/code_context.txt').read()
+          open('ai_input/code_context.txt', 'w').write(content[:60000])
+          print(f'Context size: {len(content)} chars (truncated to 60000)')
+          "
+
+      # AI analisis kode untuk temukan endpoint asli
+      - name: AI - Analyze & Extract Real API Endpoints
         run: |
+          CODE=$(cat ai_input/code_context.txt)
+
+          PROMPT="Kamu adalah security researcher yang menganalisis kode Java hasil decompile dari APK Android.
+
+          Berikut kode dari APK:
+          ---
+          $CODE
+          ---
+
+          Tugasmu:
+          1. Temukan semua BASE URL / API endpoint yang NYATA (bukan komentar, bukan test, bukan library internal)
+          2. Identifikasi path-path API (contoh: /v1/user, /api/finance/quote, dll)
+          3. Identifikasi method HTTP yang dipakai (GET/POST/PUT/DELETE)
+          4. Identifikasi parameter yang dibutuhkan jika ada
+
+          Output HANYA dalam format JSON seperti ini, tanpa penjelasan lain:
+          {
+            \"base_urls\": [\"https://api.example.com\"],
+            \"endpoints\": [
+              {
+                \"method\": \"GET\",
+                \"path\": \"/v1/finance/quote\",
+                \"full_url\": \"https://api.example.com/v1/finance/quote\",
+                \"params\": [\"symbol\", \"region\"],
+                \"confidence\": \"high\"
+              }
+            ]
+          }"
+
+          opencode run "$PROMPT" > ai_output_raw.txt 2>&1
+          cat ai_output_raw.txt
+
+          # Ekstrak JSON dari output AI
           python3 - << 'EOF'
-          import json
-          with open("urls.txt") as f:
-              urls = [l.strip() for l in f if l.strip()]
-          out = {"total": len(urls), "urls": urls, "by_domain": {}}
-          for url in urls:
+          import re, json
+
+          raw = open("ai_output_raw.txt").read()
+
+          # Cari JSON block
+          match = re.search(r'\{[\s\S]*\}', raw)
+          if match:
               try:
-                  d = url.split("/")[2]
-                  out["by_domain"].setdefault(d, []).append(url)
-              except: pass
-          json.dump(out, open("endpoints.json","w"), indent=2)
-          print(f"✅ {len(urls)} URLs saved")
+                  data = json.loads(match.group())
+                  json.dump(data, open("ai_endpoints.json", "w"), indent=2)
+                  print(f"✅ AI menemukan {len(data.get('endpoints', []))} endpoints")
+                  print(json.dumps(data, indent=2))
+              except Exception as e:
+                  print(f"❌ Parse JSON gagal: {e}")
+                  print("Raw output:", raw[:500])
+          else:
+              print("❌ Tidak ada JSON ditemukan di output AI")
+              print("Raw output:", raw[:500])
           EOF
 
-      - name: Upload artifact
+      # Test endpoint yang ditemukan AI
+      - name: Test API Endpoints
+        run: |
+          python3 - << 'EOF'
+          import json, subprocess, time
+
+          try:
+              data = json.load(open("ai_endpoints.json"))
+          except:
+              print("❌ ai_endpoints.json tidak ada atau invalid")
+              exit(0)
+
+          endpoints = data.get("endpoints", [])
+          results = []
+
+          print(f"=== Testing {len(endpoints)} endpoints ===\n")
+
+          for ep in endpoints:
+              url = ep.get("full_url", "")
+              method = ep.get("method", "GET")
+              params = ep.get("params", [])
+
+              if not url:
+                  continue
+
+              # Build curl command
+              cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}|%{time_total}|%{size_download}",
+                     "-X", method,
+                     "--max-time", "10",
+                     "--retry", "2",
+                     "-H", "User-Agent: Mozilla/5.0",
+                     "-H", "Accept: application/json",
+                     url]
+
+              print(f"Testing: [{method}] {url}")
+              try:
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                  output = result.stdout.strip()
+                  parts = output.split("|")
+                  status = parts[0] if parts else "???"
+                  time_ms = float(parts[1]) * 1000 if len(parts) > 1 else 0
+                  size = parts[2] if len(parts) > 2 else "0"
+
+                  # Tentukan status
+                  if status.startswith("2"):
+                      verdict = "✅ OK"
+                  elif status.startswith("4"):
+                      verdict = "⚠️  Auth required / Not found"
+                  elif status.startswith("5"):
+                      verdict = "🔴 Server error"
+                  else:
+                      verdict = "❓ Unknown"
+
+                  print(f"  → {verdict} | HTTP {status} | {time_ms:.0f}ms | {size} bytes")
+
+                  results.append({
+                      **ep,
+                      "test_result": {
+                          "status_code": status,
+                          "time_ms": round(time_ms),
+                          "size_bytes": size,
+                          "verdict": verdict
+                      }
+                  })
+              except Exception as e:
+                  print(f"  → ❌ Error: {e}")
+                  results.append({**ep, "test_result": {"error": str(e)}})
+
+              time.sleep(0.5)
+
+          # Simpan hasil
+          final = {
+              "total_tested": len(results),
+              "successful": len([r for r in results if r.get("test_result", {}).get("status_code", "").startswith("2")]),
+              "endpoints": results
+          }
+          json.dump(final, open("endpoints_tested.json", "w"), indent=2)
+          print(f"\n✅ Selesai — {final['successful']}/{final['total_tested']} endpoint aktif")
+          EOF
+
+      # AI summarize hasil test
+      - name: AI - Summarize Results
+        run: |
+          RESULTS=$(cat endpoints_tested.json)
+
+          opencode run "Berikut hasil test API endpoint dari APK Android:
+          $RESULTS
+
+          Buat ringkasan dalam bahasa Indonesia:
+          1. Endpoint mana yang aktif dan bisa diakses
+          2. Endpoint mana yang butuh auth
+          3. Rekomendasi endpoint paling berguna untuk dianalisis lebih lanjut
+          Format: markdown yang rapi" > ai_summary.md 2>&1
+
+          cat ai_summary.md
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: endpoints-${{ github.run_number }}
+          name: api-analysis-${{ github.run_number }}
           path: |
-            endpoints.json
-            urls.txt
+            ai_endpoints.json
+            endpoints_tested.json
+            ai_summary.md
+            ai_output_raw.txt
           retention-days: 30
 
       - name: Summary
         run: |
-          echo "## 📊 Hasil Ekstraksi" >> $GITHUB_STEP_SUMMARY
-          echo "- **Total URL:** $(wc -l < urls.txt)" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          head -20 urls.txt >> $GITHUB_STEP_SUMMARY
+          echo "## 🤖 AI API Analysis" >> $GITHUB_STEP_SUMMARY
+          cat ai_summary.md >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Raw Endpoints" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          cat endpoints_tested.json >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
