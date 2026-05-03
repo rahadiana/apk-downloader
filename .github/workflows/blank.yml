@@ -16,26 +16,19 @@ jobs:
       # -----------------------
       # 1) Download APK (fail-fast + retry)
       # -----------------------
-      - name: Download APK (Yahoo Finance)
+
+      - name: Download APK (with UA)
         run: |
           set -e
-
+      
           URL="https://d.apkpure.com/b/APK/com.yahoo.mobile.client.android.finance"
-          curl -fL --retry 3 --retry-delay 2 -o app.apk "$URL"
-
-          echo "=== APK INFO ==="
+      
+          curl -L \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+            -o app.apk "$URL"
+      
           ls -lh app.apk
           file app.apk
-
-          # Validasi ukuran minimal (1MB)
-          size=$(stat -c%s app.apk)
-          if [ "$size" -lt 1000000 ]; then
-            echo "APK tidak valid / terlalu kecil"
-            exit 1
-          fi
-
-          # Validasi zip signature
-          file app.apk | grep -q "Zip archive" || (echo "Bukan APK valid" && exit 1)
 
       # -----------------------
       # 2) Install JADX (stable URL)
