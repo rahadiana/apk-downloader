@@ -3,92 +3,185 @@ name: Extract API from APK
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:  # bisa trigger manual juga
 
 jobs:
   extract:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30  # naikkan — Yahoo Finance APK besar
 
     steps:
-      - name: Install deps
-        run: sudo apt update && sudo apt install -y curl unzip python3
+      - name: Checkout
+        uses: actions/checkout@v4
 
       # -----------------------
-      # 1) Download APK (header + retry + validate)
+      # 1) Install dependencies
+      # -----------------------
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl unzip python3 default-jre-headless
+
+      # -----------------------
+      # 2) Download APK via apkeep (lebih reliable dari APKPure)
       # -----------------------
       - name: Download APK
         run: |
           set -e
 
-          URL="https://d.apkpure.com/b/APK/com.yahoo.mobile.client.android.finance"
+          # Install apkeep
+          curl -fsSL https://github.com/EFForg/apkeep/releases/download/0.17.0/apkeep-x86_64-unknown-linux-gnu \
+            -o apkeep
+          chmod +x apkeep
 
-          curl -fL \
-            --retry 5 --retry-delay 2 \
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-            -H "Referer: https://apkpure.com/" \
-            -o app.apk "$URL"
+          # Download dari Google Play (tanpa login, public APK)
+          ./apkeep -a com.yahoo.mobile.client.android.finance .
+
+          # Cari file APK yang didownload
+          APK_FILE=$(find . -name "*.apk" | head -1)
+          if [ -z "$APK_FILE" ]; then
+            echo "❌ APK tidak ditemukan"
+            exit 1
+          fi
+
+          mv "$APK_FILE" app.apk
 
           echo "=== APK INFO ==="
           ls -lh app.apk
           file app.apk
 
-          # Validasi: ukuran & zip signature
+          # Validasi
           size=$(stat -c%s app.apk)
+          echo "Ukuran: $size bytes"
           if [ "$size" -lt 1000000 ]; then
-            echo "APK invalid (terlalu kecil / kena blok)"
+            echo "❌ APK terlalu kecil / tidak valid"
             exit 1
           fi
 
-          file app.apk | grep -q "Zip archive" || (echo "Bukan APK valid" && exit 1)
+          file app.apk | grep -q "Zip archive" || {
+            echo "❌ Bukan ZIP/APK valid"
+            exit 1
+          }
 
-          unzip -l app.apk | grep -q "classes.dex" || (echo "APK tanpa dex" && exit 1)
+          unzip -l app.apk | grep -q "classes.dex" || {
+            echo "❌ APK tidak punya classes.dex"
+            exit 1
+          }
+
+          echo "✅ APK valid"
 
       # -----------------------
-      # 2) Install JADX
+      # 3) Install JADX
       # -----------------------
       - name: Install JADX
         run: |
           set -e
-
-          curl -fL --retry 3 -o jadx.zip \
-            https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
-
-          unzip -q jadx.zip
-          chmod +x bin/jadx
+          # FIX: nama file harus "jadx.zip", bukan [jadx.zip](http://jadx.zip)
+          curl -fL --retry 3 \
+            -o jadx.zip \
+            https://github.com/skylot/jadx/releases/download/v1.5.1/jadx-1.5.1.zip
+          unzip -q jadx.zip -d jadx-dist
+          chmod +x jadx-dist/bin/jadx
+          echo "✅ JADX siap: $(jadx-dist/bin/jadx --version)"
 
       # -----------------------
-      # 3) Decompile
+      # 4) Decompile
       # -----------------------
       - name: Decompile
         run: |
           set -e
           mkdir -p out
-          ./bin/jadx -d out app.apk
+
+          # Tambah memory untuk APK besar
+          export JAVA_OPTS="-Xmx4g"
+
+          jadx-dist/bin/jadx \
+            --threads-count 4 \
+            --no-res \
+            -d out \
+            app.apk
 
           echo "=== OUT ==="
-          ls -lah out || (echo "out kosong" && exit 1)
+          ls -lah out/
+          find out -name "*.java" | wc -l | xargs -I{} echo "Total .java files: {}"
 
       # -----------------------
-      # 4) Extract endpoint
+      # 5) Extract endpoints
       # -----------------------
       - name: Extract endpoints
         run: |
-          grep -RhoE "https?://[^\" ]+" out | sort -u > urls.txt || true
-          wc -l urls.txt
+          set -e
+
+          # Cari semua URL dari hasil decompile
+          grep -RhoE 'https?://[^"'\'' \t\n\r<>{}|\\^`]+' out/ \
+            | grep -v '\.class$' \
+            | sort -u \
+            > urls_raw.txt || true
+
+          # Filter URL yang relevan (singkirkan library/boilerplate)
+          grep -v -E \
+            '(schemas\.android\.com|w3\.org|apache\.org|google\.com/schemas|xmlns|example\.com)' \
+            urls_raw.txt > urls.txt || true
+
+          echo "=== HASIL ==="
+          echo "Total URL ditemukan: $(wc -l < urls.txt)"
+          echo ""
+          echo "--- 50 URL pertama ---"
           head -n 50 urls.txt
 
       # -----------------------
-      # 5) JSON
+      # 6) Convert ke JSON
       # -----------------------
-      - name: Convert JSON
+      - name: Convert to JSON
         run: |
-          python3 -c "import json; print(json.dumps({'urls':[l.strip() for l in open('urls.txt')]}))" > endpoints.json
+          python3 - << 'EOF'
+          import json
+
+          with open("urls.txt") as f:
+              urls = [line.strip() for line in f if line.strip()]
+
+          # Kategorikan berdasarkan domain
+          output = {
+              "total": len(urls),
+              "urls": urls,
+              "by_domain": {}
+          }
+
+          for url in urls:
+              try:
+                  domain = url.split("/")[2]
+                  output["by_domain"].setdefault(domain, []).append(url)
+              except IndexError:
+                  pass
+
+          with open("endpoints.json", "w") as f:
+              json.dump(output, f, indent=2)
+
+          print(f"✅ Saved {len(urls)} URLs ke endpoints.json")
+          EOF
 
       # -----------------------
-      # 6) Upload
+      # 7) Upload artifact
       # -----------------------
-      - name: Upload
+      - name: Upload endpoints
         uses: actions/upload-artifact@v4
         with:
-          name: endpoints
-          path: endpoints.json
+          name: endpoints-${{ github.run_number }}
+          path: |
+            endpoints.json
+            urls.txt
+          retention-days: 30
+
+      # -----------------------
+      # 8) Summary di GitHub UI
+      # -----------------------
+      - name: Summary
+        run: |
+          echo "## 📊 Hasil Ekstraksi" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total URL:** $(wc -l < urls.txt)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Run:** #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Sample URLs" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          head -20 urls.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
