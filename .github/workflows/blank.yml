@@ -21,9 +21,12 @@ jobs:
       - name: Download APK
         run: |
           curl -fL --retry 3 \
+            -H "Accept: application/vnd.git-lfs+json" \
             -o app.apk \
-            "https://raw.githubusercontent.com/rahadiana/apk-downloader/refs/heads/main/ini.apk"
+            "https://media.githubusercontent.com/media/rahadiana/apk-downloader/main/ini.apk"
+          
           ls -lh app.apk
+          file app.apk
           file app.apk | grep -q "Zip archive" || { echo "❌ Bukan APK valid"; exit 1; }
           unzip -l app.apk | grep -q "classes.dex" || { echo "❌ Tidak ada dex"; exit 1; }
           echo "✅ APK valid"
