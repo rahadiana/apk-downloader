@@ -1,4 +1,4 @@
-name: Universal AI APK Auditor - The Surgeon
+name: Universal AI APK Auditor - The Clean Version
 
 on:
   push:
@@ -11,21 +11,25 @@ on:
         default: 'https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk'
 
 jobs:
-  surgeon-audit:
+  clean-audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Forensic Tools
+      ## 1. SETUP TOOLS
+      - name: Install Tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y wget unzip python3 curl
+          # JADX
           wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
+          # Bun & OpenCode
           curl -fsSL https://bun.sh/install | bash
           echo "$HOME/.bun/bin" >> $GITHUB_PATH
 
+      ## 2. DOWNLOAD & BONGKAR
       - name: Download & Decompile
         run: |
           APK_URL="${{ github.event.inputs.apk_url }}"
@@ -33,89 +37,72 @@ jobs:
           curl -L -f -o target.apk "$APK_URL"
           jadx target.apk -d extracted_source --no-res --show-bad-code --threads-count 4
 
-      - name: Extract Core Logic (Filtering)
+      ## 3. FILTER FILE (BIAR GAK KEPENUHAN)
+      - name: Select Core Files
         run: |
           python3 - << 'EOF'
           import os, json
           source_dir = 'extracted_source'
-          important_stuff = ""
+          context = []
+          patterns = ['retrofit', 'okhttp', '@GET', '@POST', 'Interceptor', 'X-So-']
           
-          # Cari file yang isinya bener-bener 'daging' (Interface Retrofit / API)
-          patterns = ['@GET', '@POST', 'interface', 'OkHttpClient', 'Interceptor']
-          count = 0
           for root, _, files in os.walk(source_dir):
               for file in files:
                   if file.endswith(('.java', '.kt')):
-                      with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
-                          content = f.read()
-                          if any(k in content for k in patterns):
-                              important_stuff += f"\n--- FILE: {file} ---\n{content[:5000]}\n"
-                              count += 1
-                  if count > 20: break # Batasi 20 file paling 'daging' biar AI gak pusing
-
-          with open('surgeon_context.txt', 'w') as f:
-              f.write(important_stuff)
+                      try:
+                          with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
+                              content = f.read()
+                              if any(k in content for k in patterns):
+                                  context.append(f"--- FILE: {file} ---\n{content[:6000]}")
+                      except: continue
+          
+          # Ambil 30 file paling penting biar AI fokus
+          with open('clean_context.txt', 'w') as f:
+              f.write("\n".join(context[:30]))
           EOF
 
-      - name: AI Data Extraction
+      ## 4. SINGLE AI PASS (MINTA JSON RAPIH)
+      - name: AI Audit
         run: |
           ~/.bun/bin/bun install -g opencode-ai
-          # AI cuma disuruh cari data mentah, bukan disuruh bikin JSON Postman yang ribet
-          echo "Tugasmu adalah mengekstrak semua endpoint API. 
-          FORMAT OUTPUT WAJIB:
-          METHOD | URL | HEADERS | DESCRIPTION
-          Contoh: GET | /api/v1/event/{{id}} | X-So-Auth, User-Agent | Get event details
           
-          DATA SUMBER:
-          $(cat surgeon_context.txt)" > surgeon_prompt.txt
+          echo "Tugasmu adalah menganalisis kode sumber APK ini dan membuat Postman Collection V2.1.
           
-          cat surgeon_prompt.txt | ~/.bun/bin/opencode run > raw_endpoints.txt
+          INSTRUKSI:
+          1. Temukan Base URL dan semua Endpoint API.
+          2. Kelompokkan ke dalam FOLDER yang logis.
+          3. Gunakan variabel {{baseUrl}} untuk semua request.
+          4. Masukkan Header yang ditemukan (seperti User-Agent, X-So-Auth, dll).
+          5. OUTPUT HARUS HANYA JSON VALID (POSTMAN COLLECTION). JANGAN ADA PENJELASAN TEKS.
+          
+          KODE SUMBER:
+          $(cat clean_context.txt)" > clean_prompt.txt
+          
+          cat clean_prompt.txt | ~/.bun/bin/opencode run > result.json
 
-      - name: Python Architect (Rakit Postman)
+      ## 5. FINAL POLISH (PASTIKAN JSON VALID)
+      - name: Final Validation
         run: |
           python3 - << 'EOF'
           import json, re
-          
-          endpoints = []
-          raw_data = open('raw_endpoints.txt').read()
-          
-          # Parsing data mentah dari AI
-          lines = raw_data.split('\n')
-          for line in lines:
-              if '|' in line:
-                  parts = line.split('|')
-                  if len(parts) >= 3:
-                      method = parts[0].strip()
-                      url = parts[1].strip()
-                      headers = parts[2].strip().split(',')
-                      endpoints.append({"method": method, "url": url, "headers": headers})
-
-          # Rakit jadi JSON Postman yang VALID
-          postman = {
-              "info": {"name": "Surgeon Audit Result", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
-              "item": []
-          }
-          
-          for ep in endpoints:
-              header_list = [{"key": h.strip(), "value": "FILL_ME"} for h in ep['headers'] if h.strip()]
-              # Tambahin header anti-403 otomatis
-              header_list.append({"key": "User-Agent", "value": "Mozilla/5.0"})
-              
-              postman['item'].append({
-                  "name": ep['url'],
-                  "request": {
-                      "method": ep['method'],
-                      "header": header_list,
-                      "url": {"raw": "{{baseUrl}}" + ep['url'], "host": ["{{baseUrl}}"], "path": ep['url'].split('/')}
-                  }
-              })
-          
-          with open('Surgeon_Final_Audit.json', 'w') as f:
-              json.dump(postman, f, indent=4)
+          try:
+              content = open('result.json').read()
+              # Bersihkan teks sampah kalau AI curhat
+              match = re.search(r'(\{.*\})', content, re.DOTALL)
+              if match:
+                  data = json.loads(match.group(1))
+                  with open('Final_Audit_Result.json', 'w') as f:
+                      json.dump(data, f, indent=4)
+                  print("✅ JSON Berhasil Dirapikan!")
+              else:
+                  print("❌ AI Gagal ngasih JSON.")
+          except Exception as e:
+              print(f"❌ Error: {e}")
           EOF
 
-      - name: Save Result
+      ## 6. SAVE RESULT
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: surgeon-audit
-          path: Surgeon_Final_Audit.json
+          name: api-audit-rapih
+          path: Final_Audit_Result.json
