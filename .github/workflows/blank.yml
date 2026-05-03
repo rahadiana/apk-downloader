@@ -1,4 +1,4 @@
-name: Extract & Test API from APK (AI-powered)
+name: Extract & Test API from APK (AI Deep Analysis)
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 jobs:
   extract:
     runs-on: ubuntu-latest
-    timeout-minutes: 260
+    timeout-minutes: 460
 
     steps:
       - uses: actions/checkout@v4
@@ -16,7 +16,7 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y unzip python3 default-jre-headless curl
+          sudo apt-get install -y unzip python3 python3-pip curl jq
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v1
@@ -28,228 +28,612 @@ jobs:
           bun install -g opencode-ai
           sleep 5
 
+      - name: Install Python deps
+        run: |
+          pip install androguard --quiet
+
       - name: Download APK
         run: |
           curl -fL --retry 3 \
             -o app.apk \
-            "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk"
+            "https://raw.githubusercontent.com/rahadiana/apk-downloader/refs/heads/main/ini.apk"
           unzip -t app.apk > /dev/null 2>&1 || { echo "❌ Tidak bisa di-unzip"; exit 1; }
           unzip -l app.apk | grep -q "classes.dex" || { echo "❌ Tidak ada dex"; exit 1; }
-          echo "✅ APK valid"
+          echo "✅ APK valid — $(ls -lh app.apk | awk '{print $5}')"
 
-      - name: Install JADX
+      # -------------------------------------------------------
+      # FAST: Ekstrak string langsung dari DEX (30-60 detik)
+      # -------------------------------------------------------
+      - name: Extract strings from DEX (fast)
         run: |
-          curl -fL --retry 3 -o jadx.zip \
-            https://github.com/skylot/jadx/releases/download/v1.5.1/jadx-1.5.1.zip
-          unzip -q jadx.zip -d jadx-dist
-          chmod +x jadx-dist/bin/jadx
+          mkdir -p dex_files ai_input
 
-      - name: Decompile
-        run: |
-          mkdir -p out
-          export JAVA_OPTS="-Xmx4g"
-          jadx-dist/bin/jadx --threads-count 4 --no-res -d out app.apk || true
-          echo "Total .java: $(find out -name '*.java' | wc -l)"
+          echo ">>> Ekstrak file DEX dari APK..."
+          unzip -o app.apk "*.dex" -d dex_files/
+          ls -lh dex_files/
 
-      # Kumpulkan file Java yang paling relevan untuk AI
-      - name: Prepare context for AI
-        run: |
-          mkdir -p ai_input
+          echo ">>> Parsing DEX strings..."
+          python3 - << 'EOF'
+          import os, re, json
 
-          # Cari file yang kemungkinan besar berisi API calls
-          # (Retrofit, OkHttp, Volley, URL, HttpURLConnection, @GET, @POST, @PUT)
-          grep -rl \
-            -e "Retrofit\|OkHttp\|@GET\|@POST\|@PUT\|@DELETE\|@PATCH\|BaseUrl\|BASE_URL\|HttpUrl\|buildUpon\|addPathSegment" \
-            out/ 2>/dev/null \
-            | head -30 > ai_input/relevant_files.txt
+          all_strings = set()
+          dex_dir = "dex_files"
 
-          echo "=== File relevan ditemukan: $(wc -l < ai_input/relevant_files.txt) ==="
-          cat ai_input/relevant_files.txt
+          try:
+              from androguard.core.bytecodes.dvm import DalvikVMFormat
+              for dex_file in sorted(os.listdir(dex_dir)):
+                  if not dex_file.endswith(".dex"):
+                      continue
+                  print(f"  Processing {dex_file}...")
+                  try:
+                      with open(f"{dex_dir}/{dex_file}", "rb") as f:
+                          d = DalvikVMFormat(f.read())
+                      for s in d.get_strings():
+                          all_strings.add(str(s))
+                  except Exception as e:
+                      print(f"    skip: {e}")
+          except ImportError:
+              # Fallback: ekstrak string pakai strings command
+              print("  Androguard tidak tersedia, pakai strings command...")
+              import subprocess
+              for dex_file in sorted(os.listdir(dex_dir)):
+                  if not dex_file.endswith(".dex"):
+                      continue
+                  result = subprocess.run(
+                      ["strings", "-n", "4", f"{dex_dir}/{dex_file}"],
+                      capture_output=True, text=True
+                  )
+                  for line in result.stdout.splitlines():
+                      all_strings.add(line.strip())
 
-          # Gabungkan isi file-file itu (max 50k chars biar tidak overflow)
-          while IFS= read -r f; do
-            echo "=== FILE: $f ===" >> ai_input/code_context.txt
-            cat "$f" >> ai_input/code_context.txt
-            echo "" >> ai_input/code_context.txt
-          done < ai_input/relevant_files.txt
+          print(f"\n  Total strings: {len(all_strings)}")
 
-          # Potong kalau terlalu panjang
-          python3 -c "
-          content = open('ai_input/code_context.txt').read()
-          open('ai_input/code_context.txt', 'w').write(content[:60000])
-          print(f'Context size: {len(content)} chars (truncated to 60000)')
-          "
+          # --- Kategorisasi ---
+          urls          = set()
+          api_paths     = set()
+          base_urls     = set()
+          auth_strings  = set()
+          host_strings  = set()
+          interesting   = set()
 
-      # AI analisis kode untuk temukan endpoint asli
-      - name: AI - Analyze & Extract Real API Endpoints
+          URL_RE   = re.compile(r'^https?://.{4,}')
+          PATH_RE  = re.compile(r'^/(?:api|v\d|rest|service|endpoint|graphql|query|auth|oauth|user|account|finance|market|stock|quote|search|data|feed)[/\w\-\.%{}]*', re.I)
+          PATH2_RE = re.compile(r'^/[a-zA-Z][a-zA-Z0-9_\-/\.]{4,}$')
+          HOST_RE  = re.compile(r'^[a-z0-9\-]+\.[a-z]{2,}(?:\.[a-z]{2,})?$')
+
+          for s in all_strings:
+              s = s.strip()
+              if not s or len(s) < 3:
+                  continue
+
+              if URL_RE.match(s):
+                  urls.add(s)
+                  # Base URL detection
+                  if not any(c in s[8:] for c in ['?', '{', ' ', '\n']):
+                      if s.count('/') <= 4:
+                          base_urls.add(s.rstrip('/'))
+
+              elif PATH_RE.match(s):
+                  api_paths.add(s)
+              elif PATH2_RE.match(s) and len(s) > 5:
+                  api_paths.add(s)
+
+              elif HOST_RE.match(s) and '.' in s:
+                  host_strings.add(s)
+
+              if any(kw in s.lower() for kw in [
+                  'bearer', 'authorization', 'x-api-key', 'api_key', 'apikey',
+                  'token', 'secret', 'client_id', 'client_secret', 'access_key'
+              ]):
+                  auth_strings.add(s)
+
+              if any(kw in s.lower() for kw in [
+                  'retrofit', 'okhttp', '@get', '@post', 'graphql', 'websocket',
+                  'baseurl', 'base_url', 'endpoint', 'hostname', 'host'
+              ]):
+                  interesting.add(s)
+
+          # Simpan semua kategorisasi
+          data = {
+              "total_strings": len(all_strings),
+              "urls": sorted(urls),
+              "base_urls": sorted(base_urls),
+              "api_paths": sorted(api_paths),
+              "hosts": sorted(host_strings),
+              "auth_strings": sorted(auth_strings),
+              "interesting": sorted(interesting),
+          }
+
+          with open("ai_input/extracted.json", "w") as f:
+              json.dump(data, f, indent=2)
+
+          # Context ringkas untuk AI (max 80k chars)
+          context = []
+          context.append("=== BASE URLs ===")
+          context.extend(sorted(base_urls)[:100])
+          context.append("\n=== ALL URLs ===")
+          context.extend(sorted(urls)[:300])
+          context.append("\n=== API PATHS ===")
+          context.extend(sorted(api_paths)[:500])
+          context.append("\n=== HOSTS ===")
+          context.extend(sorted(host_strings)[:100])
+          context.append("\n=== AUTH-RELATED STRINGS ===")
+          context.extend(sorted(auth_strings)[:100])
+          context.append("\n=== INTERESTING STRINGS ===")
+          context.extend(sorted(interesting)[:200])
+
+          full = "\n".join(context)
+          if len(full) > 80000:
+              full = full[:80000]
+
+          with open("ai_input/code_context.txt", "w") as f:
+              f.write(full)
+
+          print(f"\n✅ Kategorisasi selesai:")
+          print(f"   URLs       : {len(urls)}")
+          print(f"   Base URLs  : {len(base_urls)}")
+          print(f"   API Paths  : {len(api_paths)}")
+          print(f"   Hosts      : {len(host_strings)}")
+          print(f"   Auth strs  : {len(auth_strings)}")
+          print(f"   Interesting: {len(interesting)}")
+          EOF
+
+      # -------------------------------------------------------
+      # AI Round 1: Analisis mendalam, temukan endpoint nyata
+      # -------------------------------------------------------
+      - name: AI Round 1 - Deep Endpoint Extraction
         run: |
           CODE=$(cat ai_input/code_context.txt)
 
-          PROMPT="Kamu adalah security researcher yang menganalisis kode Java hasil decompile dari APK Android.
+          PROMPT='Kamu adalah elite mobile security researcher dengan spesialisasi reverse engineering Android APK.
 
-          Berikut kode dari APK:
-          ---
-          $CODE
-          ---
+Kamu diberikan hasil ekstraksi string dari file DEX (bytecode) Android APK. Data ini mencakup semua URL, path API, hostname, dan string menarik yang ditemukan di dalam APK.
 
-          Tugasmu:
-          1. Temukan semua BASE URL / API endpoint yang NYATA (bukan komentar, bukan test, bukan library internal)
-          2. Identifikasi path-path API (contoh: /v1/user, /api/finance/quote, dll)
-          3. Identifikasi method HTTP yang dipakai (GET/POST/PUT/DELETE)
-          4. Identifikasi parameter yang dibutuhkan jika ada
+DATA EKSTRAKSI:
+---
+'"$CODE"'
+---
 
-          Output HANYA dalam format JSON seperti ini, tanpa penjelasan lain:
-          {
-            \"base_urls\": [\"https://api.example.com\"],
-            \"endpoints\": [
-              {
-                \"method\": \"GET\",
-                \"path\": \"/v1/finance/quote\",
-                \"full_url\": \"https://api.example.com/v1/finance/quote\",
-                \"params\": [\"symbol\", \"region\"],
-                \"confidence\": \"high\"
-              }
-            ]
-          }"
+LAKUKAN ANALISIS SANGAT MENDALAM:
 
-          opencode run "$PROMPT" > ai_output_raw.txt 2>&1
-          cat ai_output_raw.txt
+1. REKONSTRUKSI ARSITEKTUR API:
+   - Identifikasi base URL production (dan staging jika ada)
+   - Tentukan framework HTTP yang dipakai (dari string yang ada)
+   - Identifikasi versi API (v1, v2, v3, dll)
+   - Apakah ada multiple environment (prod/staging/dev)?
 
-          # Ekstrak JSON dari output AI
-          python3 - << 'EOF'
+2. REKONSTRUKSI ENDPOINT LENGKAP:
+   - Gabungkan base URL + path yang cocok
+   - Jangan asumsikan — hanya rekonstruksi yang MASUK AKAL berdasarkan data
+   - Perhatikan pola: /api/v1/xxx, /v2/xxx, /finance/v2/xxx, dll
+   - Identifikasi endpoint yang jelas public (quote, search, market data)
+   - Identifikasi endpoint yang butuh auth (user, account, portfolio, dll)
+
+3. IDENTIFIKASI AUTH MECHANISM:
+   - Header auth apa yang dipakai? (Authorization, X-Api-Key, dll)
+   - Apakah ada API key yang hardcoded?
+   - Token format apa? (Bearer JWT, Basic, Custom)
+
+4. PRIORITASKAN ENDPOINT YANG BISA DITEST TANPA AUTH:
+   - Market data, stock quotes, search, news feed
+   - Endpoint yang hanya butuh symbol saham (AAPL, TSLA, dll)
+
+5. UNTUK SETIAP ENDPOINT — TENTUKAN:
+   - Apakah ini endpoint NYATA atau library/internal Android?
+   - Level confidence: high (URL lengkap jelas), medium (rekonstruksi), low (spekulasi)
+   - Hanya sertakan confidence high dan medium
+
+OUTPUT HARUS berupa JSON murni, tidak ada teks di luar JSON:
+{
+  "app_package": "com.xxx",
+  "app_name": "nama app",
+  "network_framework": "OkHttp/Retrofit/dll",
+  "base_urls": {
+    "production": "https://...",
+    "staging": null,
+    "cdn": null,
+    "other": []
+  },
+  "auth": {
+    "type": "Bearer/ApiKey/Basic/None/Mixed",
+    "header_name": "Authorization",
+    "hardcoded_key": "key jika ada atau null",
+    "token_endpoint": "/path/to/login atau null",
+    "notes": "penjelasan detail mekanisme auth"
+  },
+  "endpoints": [
+    {
+      "id": 1,
+      "method": "GET",
+      "path": "/v1/finance/quote",
+      "full_url": "https://api.example.com/v1/finance/quote",
+      "requires_auth": false,
+      "query_params": [
+        {"name": "symbol", "required": true, "example": "AAPL"},
+        {"name": "region", "required": false, "example": "US"},
+        {"name": "lang", "required": false, "example": "en-US"}
+      ],
+      "body_params": [],
+      "required_headers": {
+        "User-Agent": "contoh user agent app",
+        "Accept": "application/json"
+      },
+      "response_description": "Data quote saham real-time",
+      "confidence": "high",
+      "notes": "Endpoint public tanpa auth"
+    }
+  ],
+  "websockets": [],
+  "graphql_endpoints": [],
+  "hardcoded_secrets": []
+}'
+
+          opencode run "$PROMPT" > ai_round1_raw.txt 2>&1
+          echo "=== AI Round 1 Output ==="
+          cat ai_round1_raw.txt
+
+          python3 - << 'PYEOF'
+          import re, json, sys
+
+          raw = open("ai_round1_raw.txt").read()
+
+          best = None
+          for m in re.finditer(r'\{', raw):
+              for end in range(len(raw), m.start(), -1):
+                  try:
+                      candidate = raw[m.start():end]
+                      data = json.loads(candidate)
+                      if "endpoints" in data and len(data["endpoints"]) > 0:
+                          best = data
+                          break
+                  except:
+                      continue
+              if best:
+                  break
+
+          if best:
+              json.dump(best, open("ai_endpoints.json", "w"), indent=2)
+              eps = best.get("endpoints", [])
+              public = [e for e in eps if not e.get("requires_auth", True)]
+              auth   = [e for e in eps if e.get("requires_auth", True)]
+              print(f"✅ Ditemukan {len(eps)} endpoints")
+              print(f"   ├─ {len(public)} public (siap ditest)")
+              print(f"   └─ {len(auth)} butuh auth")
+          else:
+              print("⚠️  Tidak ada JSON valid, simpan raw")
+              json.dump({"endpoints": [], "raw": raw[:2000]}, open("ai_endpoints.json","w"))
+          PYEOF
+
+      # -------------------------------------------------------
+      # AI Round 2: Build curl commands yang siap dijalankan
+      # -------------------------------------------------------
+      - name: AI Round 2 - Build Executable Test Cases
+        run: |
+          ENDPOINTS=$(cat ai_endpoints.json)
+
+          PROMPT='Kamu adalah API testing expert yang sangat berpengalaman.
+
+Berdasarkan endpoint yang ditemukan:
+'"$ENDPOINTS"'
+
+Tugasmu: Buat curl command yang BENAR-BENAR SIAP DIEKSEKUSI untuk setiap endpoint.
+
+ATURAN KETAT:
+1. Setiap curl harus bisa langsung di-copy-paste dan dijalankan di terminal
+2. Untuk Yahoo Finance / finance app — gunakan contoh nyata:
+   - Saham: AAPL, TSLA, MSFT, GOOGL, AMZN, BTC-USD, ETH-USD
+   - Region: US, ID, SG
+   - Language: en-US, id-ID
+3. Sertakan header yang realistis persis seperti yang dikirim mobile app:
+   - User-Agent dari Yahoo Finance Android
+   - Accept, Accept-Language, Accept-Encoding
+   - Cookie / X-Yahoo-App-Version jika relevan
+4. Urutkan: public endpoint dulu, auth endpoint terakhir
+5. Untuk endpoint yang butuh AUTH: tetap buat tapi ganti token dengan placeholder [BEARER_TOKEN]
+6. Buat VARIASI untuk endpoint penting (misal quote dengan berbagai symbol)
+
+OUTPUT JSON murni:
+{
+  "test_cases": [
+    {
+      "id": 1,
+      "name": "Stock Quote - AAPL",
+      "description": "Ambil data real-time saham Apple",
+      "endpoint_id": 1,
+      "curl_command": "curl -s -w \"\\n%{http_code}\" --max-time 15 -X GET \"https://api.example.com/v1/finance/quote?symbol=AAPL&region=US&lang=en-US\" -H \"User-Agent: Mozilla/5.0\" -H \"Accept: application/json\" -H \"Accept-Language: en-US\"",
+      "requires_auth": false,
+      "expected_status": 200,
+      "priority": "high"
+    }
+  ]
+}'
+
+          opencode run "$PROMPT" > ai_round2_raw.txt 2>&1
+
+          python3 - << 'PYEOF'
           import re, json
 
-          raw = open("ai_output_raw.txt").read()
+          raw = open("ai_round2_raw.txt").read()
+          best = None
+          for m in re.finditer(r'\{', raw):
+              for end in range(len(raw), m.start(), -1):
+                  try:
+                      candidate = raw[m.start():end]
+                      data = json.loads(candidate)
+                      if "test_cases" in data and len(data["test_cases"]) > 0:
+                          best = data
+                          break
+                  except:
+                      continue
+              if best:
+                  break
 
-          # Cari JSON block
-          match = re.search(r'\{[\s\S]*\}', raw)
-          if match:
-              try:
-                  data = json.loads(match.group())
-                  json.dump(data, open("ai_endpoints.json", "w"), indent=2)
-                  print(f"✅ AI menemukan {len(data.get('endpoints', []))} endpoints")
-                  print(json.dumps(data, indent=2))
-              except Exception as e:
-                  print(f"❌ Parse JSON gagal: {e}")
-                  print("Raw output:", raw[:500])
+          if best:
+              json.dump(best, open("ai_test_cases.json","w"), indent=2)
+              print(f"✅ {len(best['test_cases'])} test cases siap dieksekusi")
           else:
-              print("❌ Tidak ada JSON ditemukan di output AI")
-              print("Raw output:", raw[:500])
-          EOF
+              # Fallback: generate dari round 1
+              print("⚠️ Fallback: generate test cases dari round 1")
+              eps = json.load(open("ai_endpoints.json")).get("endpoints", [])
+              cases = []
+              for i, ep in enumerate(eps):
+                  url = ep.get("full_url", "")
+                  if not url:
+                      continue
+                  method = ep.get("method", "GET")
+                  params = ep.get("query_params", [])
+                  qstr = "&".join([f"{p['name']}={p.get('example','test')}" for p in params[:5]])
+                  full_url = f"{url}?{qstr}" if qstr else url
+                  headers = ep.get("required_headers", {})
+                  header_str = " ".join([f'-H "{k}: {v}"' for k,v in headers.items()])
+                  cases.append({
+                      "id": i+1,
+                      "name": f"{method} {ep.get('path','')}",
+                      "description": ep.get("response_description",""),
+                      "curl_command": f'curl -s -w "\\n%{{http_code}}" --max-time 15 -X {method} "{full_url}" -H "Accept: application/json" -H "User-Agent: YahooFinance/1.0" {header_str}',
+                      "requires_auth": ep.get("requires_auth", True),
+                      "expected_status": 200,
+                      "priority": "high" if not ep.get("requires_auth") else "low"
+                  })
+              json.dump({"test_cases": cases}, open("ai_test_cases.json","w"), indent=2)
+              print(f"✅ Fallback: {len(cases)} test cases dibuat")
+          PYEOF
 
-      # Test endpoint yang ditemukan AI
-      - name: Test API Endpoints
+      # -------------------------------------------------------
+      # Execute: Jalankan semua test cases
+      # -------------------------------------------------------
+      - name: Execute API Tests
         run: |
-          python3 - << 'EOF'
-          import json, subprocess, time
+          python3 - << 'PYEOF'
+          import json, subprocess, time, sys
 
           try:
-              data = json.load(open("ai_endpoints.json"))
-          except:
-              print("❌ ai_endpoints.json tidak ada atau invalid")
-              exit(0)
+              cases = json.load(open("ai_test_cases.json")).get("test_cases", [])
+          except Exception as e:
+              print(f"❌ Gagal load: {e}")
+              sys.exit(0)
 
-          endpoints = data.get("endpoints", [])
           results = []
+          print(f"\n{'='*65}")
+          print(f"  RUNNING {len(cases)} API TESTS")
+          print(f"{'='*65}\n")
 
-          print(f"=== Testing {len(endpoints)} endpoints ===\n")
+          for case in cases:
+              name     = case.get("name", "unknown")
+              cmd_str  = case.get("curl_command", "")
+              req_auth = case.get("requires_auth", True)
+              desc     = case.get("description","")
 
-          for ep in endpoints:
-              url = ep.get("full_url", "")
-              method = ep.get("method", "GET")
-              params = ep.get("params", [])
-
-              if not url:
+              if not cmd_str:
                   continue
 
-              # Build curl command
-              cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}|%{time_total}|%{size_download}",
-                     "-X", method,
-                     "--max-time", "10",
-                     "--retry", "2",
-                     "-H", "User-Agent: Mozilla/5.0",
-                     "-H", "Accept: application/json",
-                     url]
+              if "[BEARER_TOKEN]" in cmd_str or "[TOKEN]" in cmd_str:
+                  print(f"⏭  SKIP (need token): {name}")
+                  results.append({**case, "result": {"status": "skipped", "reason": "requires auth token"}})
+                  continue
 
-              print(f"Testing: [{method}] {url}")
+              print(f"{'─'*65}")
+              print(f"🔍 {name}")
+              if desc:
+                  print(f"   📝 {desc}")
+              print(f"   🌐 {cmd_str[cmd_str.find('http'):cmd_str.find('http')+80]}...")
+
               try:
-                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-                  output = result.stdout.strip()
-                  parts = output.split("|")
-                  status = parts[0] if parts else "???"
-                  time_ms = float(parts[1]) * 1000 if len(parts) > 1 else 0
-                  size = parts[2] if len(parts) > 2 else "0"
+                  proc = subprocess.run(
+                      cmd_str, shell=True,
+                      capture_output=True, text=True, timeout=20
+                  )
+                  output = proc.stdout.strip()
+                  lines  = output.split("\n")
+                  status = lines[-1].strip() if lines else "000"
+                  body   = "\n".join(lines[:-1])
 
-                  # Tentukan status
+                  # Verdict
                   if status.startswith("2"):
-                      verdict = "✅ OK"
+                      verdict = "✅ SUCCESS"
+                      icon    = "✅"
+                  elif status in ["401","403"]:
+                      verdict = "🔑 AUTH REQUIRED"
+                      icon    = "🔑"
+                  elif status == "404":
+                      verdict = "❌ NOT FOUND"
+                      icon    = "❌"
+                  elif status == "429":
+                      verdict = "⏱  RATE LIMITED"
+                      icon    = "⏱"
                   elif status.startswith("4"):
-                      verdict = "⚠️  Auth required / Not found"
+                      verdict = f"⚠️  CLIENT ERROR"
+                      icon    = "⚠️"
                   elif status.startswith("5"):
-                      verdict = "🔴 Server error"
+                      verdict = f"🔴 SERVER ERROR"
+                      icon    = "🔴"
+                  elif status == "000":
+                      verdict = "💀 NO RESPONSE / BLOCKED"
+                      icon    = "💀"
                   else:
-                      verdict = "❓ Unknown"
+                      verdict = f"❓ HTTP {status}"
+                      icon    = "❓"
 
-                  print(f"  → {verdict} | HTTP {status} | {time_ms:.0f}ms | {size} bytes")
+                  print(f"   {icon} HTTP {status} — {verdict}")
+
+                  # Cek apakah response JSON valid
+                  body_preview = body[:500].strip()
+                  if body_preview.startswith("{") or body_preview.startswith("["):
+                      try:
+                          parsed = json.loads(body[:5000])
+                          print(f"   📦 Valid JSON response ({len(body)} bytes)")
+                          if isinstance(parsed, dict):
+                              print(f"   🔑 Keys: {list(parsed.keys())[:10]}")
+                      except:
+                          print(f"   📄 Response ({len(body)} bytes): {body_preview[:150]}")
+                  elif body_preview:
+                      print(f"   📄 Response: {body_preview[:150]}")
 
                   results.append({
-                      **ep,
-                      "test_result": {
+                      **case,
+                      "result": {
                           "status_code": status,
-                          "time_ms": round(time_ms),
-                          "size_bytes": size,
-                          "verdict": verdict
+                          "verdict": verdict,
+                          "response_size": len(body),
+                          "response_preview": body[:500],
+                          "is_json": body.strip().startswith(("{","[")),
+                          "success": status.startswith("2")
                       }
                   })
+
+              except subprocess.TimeoutExpired:
+                  print(f"   ⏱  TIMEOUT")
+                  results.append({**case, "result": {"status": "timeout", "success": False}})
               except Exception as e:
-                  print(f"  → ❌ Error: {e}")
-                  results.append({**ep, "test_result": {"error": str(e)}})
+                  print(f"   ❌ ERROR: {e}")
+                  results.append({**case, "result": {"status": "error", "message": str(e), "success": False}})
 
-              time.sleep(0.5)
+              time.sleep(1.5)
 
-          # Simpan hasil
+          # --- Final summary ---
+          success   = [r for r in results if r.get("result",{}).get("success")]
+          auth_req  = [r for r in results if r.get("result",{}).get("status_code") in ["401","403"]]
+          rate_lim  = [r for r in results if r.get("result",{}).get("status_code") == "429"]
+          skipped   = [r for r in results if r.get("result",{}).get("status") == "skipped"]
+          failed    = [r for r in results if not r.get("result",{}).get("success") and
+                       r.get("result",{}).get("status") not in ["skipped","timeout"]]
+
+          print(f"\n{'='*65}")
+          print(f"  📊 TEST SUMMARY")
+          print(f"{'='*65}")
+          print(f"  ✅ Success      : {len(success)}")
+          print(f"  🔑 Auth required: {len(auth_req)}")
+          print(f"  ⏱  Rate limited : {len(rate_lim)}")
+          print(f"  ⏭  Skipped      : {len(skipped)}")
+          print(f"  ❌ Failed       : {len(failed)}")
+          print(f"  Total           : {len(results)}")
+          print(f"{'='*65}\n")
+
+          if success:
+              print("🎯 ENDPOINT YANG BERHASIL:")
+              for r in success:
+                  print(f"  ✅ {r['name']} — {r['result']['status_code']}")
+
           final = {
-              "total_tested": len(results),
-              "successful": len([r for r in results if r.get("test_result", {}).get("status_code", "").startswith("2")]),
-              "endpoints": results
+              "summary": {
+                  "total": len(results),
+                  "success": len(success),
+                  "auth_required": len(auth_req),
+                  "rate_limited": len(rate_lim),
+                  "skipped": len(skipped),
+                  "failed": len(failed)
+              },
+              "results": results
           }
-          json.dump(final, open("endpoints_tested.json", "w"), indent=2)
-          print(f"\n✅ Selesai — {final['successful']}/{final['total_tested']} endpoint aktif")
-          EOF
+          json.dump(final, open("test_results.json","w"), indent=2)
+          print("\n✅ Hasil disimpan ke test_results.json")
+          PYEOF
 
-      # AI summarize hasil test
-      - name: AI - Summarize Results
+      # -------------------------------------------------------
+      # AI Round 3: Analisis hasil + laporan final
+      # -------------------------------------------------------
+      - name: AI Round 3 - Final Report
         run: |
-          RESULTS=$(cat endpoints_tested.json)
+          RESULTS=$(python3 -c "
+          import json
+          d = json.load(open('test_results.json'))
+          # Ringkas biar tidak overflow prompt
+          for r in d['results']:
+              if 'result' in r and 'response_preview' in r['result']:
+                  r['result']['response_preview'] = r['result']['response_preview'][:300]
+          print(json.dumps(d, indent=2))
+          ")
 
-          opencode run "Berikut hasil test API endpoint dari APK Android:
-          $RESULTS
+          ENDPOINTS=$(cat ai_endpoints.json)
 
-          Buat ringkasan dalam bahasa Indonesia:
-          1. Endpoint mana yang aktif dan bisa diakses
-          2. Endpoint mana yang butuh auth
-          3. Rekomendasi endpoint paling berguna untuk dianalisis lebih lanjut
-          Format: markdown yang rapi" > ai_summary.md 2>&1
+          PROMPT='Kamu adalah senior API security analyst dan reverse engineer Android.
 
-          cat ai_summary.md
+ENDPOINT YANG DITEMUKAN DARI APK:
+'"$ENDPOINTS"'
 
-      - name: Upload artifacts
+HASIL TESTING SEMUA ENDPOINT:
+'"$RESULTS"'
+
+Buat laporan SANGAT DETAIL dan ACTIONABLE dalam Bahasa Indonesia (format Markdown):
+
+## 🎯 Executive Summary
+Ringkasan 3-5 kalimat: berapa endpoint ditemukan, berapa aktif, apa temuannya.
+
+## 🏗️ Arsitektur API
+Framework, base URL, versi API, environment yang tersedia.
+
+## ✅ Endpoint Aktif (Bisa Diakses Langsung)
+Untuk setiap endpoint yang berhasil (HTTP 2xx):
+- URL lengkap + method
+- Fungsinya apa
+- Contoh curl yang bisa langsung dipakai
+- Sample response (jika ada di hasil test)
+
+## 🔑 Endpoint yang Butuh Auth
+List endpoint 401/403 dengan penjelasan auth apa yang dibutuhkan dan cara mendapatkannya.
+
+## 💡 Cara Pakai Endpoint Aktif
+Contoh penggunaan praktis dengan curl yang bisa langsung dicopy-paste.
+
+## 🔍 Analisis Teknis Mendalam
+Pattern URL, naming convention, struktur response, dll.
+
+## 🛡️ Temuan Keamanan
+Apakah ada endpoint sensitif? Data apa yang bisa diakses publik? Potensi masalah?
+
+## 🔮 Langkah Investigasi Selanjutnya
+Apa yang perlu diteliti lebih lanjut untuk mendapatkan akses lebih dalam.'
+
+          opencode run "$PROMPT" > final_report.md 2>&1
+          echo "=== FINAL REPORT ==="
+          cat final_report.md
+
+      - name: Upload All Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: api-analysis-${{ github.run_number }}
+          name: api-deep-analysis-${{ github.run_number }}
           path: |
+            ai_input/extracted.json
             ai_endpoints.json
-            endpoints_tested.json
-            ai_summary.md
-            ai_output_raw.txt
+            ai_test_cases.json
+            test_results.json
+            final_report.md
+            ai_round1_raw.txt
+            ai_round2_raw.txt
           retention-days: 30
 
-      - name: Summary
+      - name: GitHub Summary
         run: |
-          echo "## 🤖 AI API Analysis" >> $GITHUB_STEP_SUMMARY
-          cat ai_summary.md >> $GITHUB_STEP_SUMMARY
+          echo "# 🤖 AI Deep API Analysis" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Raw Endpoints" >> $GITHUB_STEP_SUMMARY
+          cat final_report.md >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "## 📊 Test Results" >> $GITHUB_STEP_SUMMARY
           echo '```json' >> $GITHUB_STEP_SUMMARY
-          cat endpoints_tested.json >> $GITHUB_STEP_SUMMARY
+          python3 -c "
+          import json
+          d = json.load(open('test_results.json'))
+          print(json.dumps(d['summary'], indent=2))
+          " >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
