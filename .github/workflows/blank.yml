@@ -45,8 +45,15 @@ jobs:
         run: |
           mkdir -p out
           export JAVA_OPTS="-Xmx4g"
-          jadx-dist/bin/jadx --threads-count 4 --no-res -d out app.apk
-          echo "Total .java: $(find out -name '*.java' | wc -l)"
+          jadx-dist/bin/jadx --threads-count 4 --no-res -d out app.apk || true  # ← tambah || true
+
+          JAVA_COUNT=$(find out -name '*.java' | wc -l)
+          echo "Total .java: $JAVA_COUNT"
+          if [ "$JAVA_COUNT" -lt 100 ]; then
+            echo "❌ Output terlalu sedikit, kemungkinan gagal"
+            exit 1
+          fi
+          echo "✅ Decompile selesai"
 
       - name: Extract endpoints
         run: |
