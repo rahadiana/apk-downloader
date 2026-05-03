@@ -31,7 +31,7 @@ jobs:
           PKG="com.yahoo.mobile.client.android.finance"
       
           # Ambil link download dari APKCombo
-          DL_PAGE=$(curl -fsSL "https://apkcombo.com/yahoo-finance/com.yahoo.mobile.client.android.finance/download/apk")
+          DL_PAGE=$(curl -fsSL "https://apkcombo.com/financial-times-business-news/com.ft.news/download/apk")
           APK_URL=$(echo "$DL_PAGE" | grep -oE 'https://[^"]+\.apk[^"]*' | head -1)
       
           if [ -z "$APK_URL" ]; then
