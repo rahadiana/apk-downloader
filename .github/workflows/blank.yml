@@ -1,4 +1,4 @@
-name: AI APK Auditor - Auto Web Navigation Mode
+name: AI APK Auditor - Robust Web Navigation
 
 on:
   push:
@@ -13,21 +13,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      ## 1. SETUP TOOLS & BROWSER
       - name: Install Forensic Tools & Playwright
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y wget unzip python3 python3-pip jq
-          # Install JADX
           wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
-          # Setup Playwright untuk navigasi web
           pip install playwright
           playwright install chromium --with-deps
 
-      ## 2. NAVIGASI WEB OTOMATIS (DOWNLOAD APK)
-      - name: Download APK via Web Navigation
+      - name: Download APK via Evozi Navigation
         run: |
           python3 - << 'EOF'
           import asyncio
@@ -35,44 +31,56 @@ jobs:
 
           async def run():
               async with async_playwright() as p:
+                  # Gunakan User Agent asli agar tidak terdeteksi bot
                   browser = await p.chromium.launch(headless=True)
-                  page = await browser.new_page()
+                  context = await browser.new_context(
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+                  )
+                  page = await context.new_page()
                   
-                  # Navigasi ke situs penyedia APK (Contoh: APKCombo atau sejenisnya)
-                  print("Navigasi ke downloader...")
-                  # Kita gunakan link direct generator agar lebih stabil
-                  target_url = "https://apkpure.com/id/tribunnews-indonesia-local-news/mobile.android.tribun/download"
-                  
-                  await page.goto(target_url, wait_until="networkidle")
-                  
-                  # Klik tombol download (Selector ini mungkin perlu disesuaikan jika web berubah)
-                  print("Mencari tombol download...")
-                  async with page.expect_download() as download_info:
-                      # Mencari link yang mengandung .apk
-                      await page.click("a.download-start-btn") 
-                  
-                  download = await download_info.value
-                  await download.save_as("tribun.apk")
-                  print(f"✅ Berhasil mendownload: {download.suggested_filename}")
-                  await browser.close()
+                  print(">>> Membuka Downloader...")
+                  try:
+                      # Gunakan situs APK-DL atau Evozi yang lebih simpel
+                      await page.goto("https://apps.evozi.com/apk-downloader/", timeout=60000)
+                      
+                      # Masukkan Package ID
+                      await page.fill("#packagename", "mobile.android.tribun")
+                      print(">>> Generate Download Link...")
+                      await page.click("button[name='generate']")
+                      
+                      # Tunggu tombol download muncul (bisa butuh waktu)
+                      download_btn_selector = "a.btn-success"
+                      await page.wait_for_selector(download_btn_selector, timeout=60000)
+                      
+                      print(">>> Memulai Download...")
+                      async with page.expect_download() as download_info:
+                          await page.click(download_btn_selector)
+                      
+                      download = await download_info.value
+                      await download.save_as("tribun.apk")
+                      print(f"✅ Berhasil: tribun.apk")
+                      
+                  except Exception as e:
+                      print(f"❌ Navigasi Gagal: {e}")
+                      # Screenshot untuk debugging jika gagal
+                      await page.screenshot(path="debug_screen.png")
+                      raise e
+                  finally:
+                      await browser.close()
 
           asyncio.run(run())
           EOF
 
-      ## 3. DECOMPILE (BONGKAR KODE)
       - name: Decompile Source Code
         run: |
           jadx tribun.apk -d extracted_source --no-res --show-bad-code --threads-count 4
-          echo "✅ Dekompilasi selesai."
 
-      ## 4. EKSTRAKSI KONTEKS UNTUK AI
       - name: Build AI Context
         run: |
           python3 - << 'EOF'
-          import os, re, json
+          import os, json
           source_dir = 'extracted_source'
-          context = {"api_logic": [], "hardcoded_secrets": []}
-          
+          context = {"api_logic": []}
           for root, _, files in os.walk(source_dir):
               for file in files:
                   if file.endswith(('.java', '.kt')):
@@ -80,34 +88,28 @@ jobs:
                       try:
                           with open(path, 'r', encoding='utf-8') as f:
                               content = f.read()
-                              if any(k in content for k in ['tribunnews', 'api', 'retrofit', 'endpoint']):
-                                  context["api_logic"].append({
-                                      "file": file,
-                                      "snippet": content[:8000]
-                                  })
+                              if any(k in content for k in ['tribun', 'api', 'retrofit']):
+                                  context["api_logic"].append({"file": file, "snippet": content[:8000]})
                       except: continue
-          
           with open('ai_input.json', 'w') as f:
               json.dump(context, f, indent=2)
           EOF
 
-      ## 5. ANALISIS AI & GENERATE POSTMAN
       - name: Setup Bun & AI
         uses: oven-sh/setup-bun@v1
         with:
           bun-version: latest
 
-      - name: AI Audit
+      - name: AI Audit & Generate Postman
         run: |
           bun install -g opencode-ai
           python3 -c "
           ctx = open('ai_input.json').read()
-          prompt = f'Kamu adalah expert API security. Dari kode APK Tribunnews ini, temukan Base URL dan semua endpoint berita. Buat Postman Collection V2.1 JSON Murni:\n{ctx[:30000]}'
+          prompt = f'Analisis API Tribunnews dari kode ini. Buat Postman Collection V2.1 JSON Murni:\n{ctx[:30000]}'
           open('prompt.txt', 'w').write(prompt)
           "
           opencode run "$(cat prompt.txt)" > raw_output.json
 
-      ## 6. CLEANUP & SAVE POSTMAN JSON
       - name: Finalize Postman Collection
         run: |
           python3 - << 'EOF'
@@ -117,15 +119,18 @@ jobs:
               match = re.search(r'(\{.*\})', content, re.DOTALL)
               if match:
                   data = json.loads(match.group(1))
-                  with open('Tribunnews_Audit.postman_collection.json', 'w') as f:
+                  with open('Tribunnews_Audit.json', 'w') as f:
                       json.dump(data, f, indent=4)
-                  print("✅ Postman Collection berhasil dibuat!")
+                  print("✅ Postman Collection siap!")
               else: sys.exit(1)
           except: sys.exit(1)
           EOF
 
-      - name: Upload Artifact
+      - name: Upload Artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tribun-api-results
-          path: Tribunnews_Audit.postman_collection.json
+          path: |
+            Tribunnews_Audit.json
+            debug_screen.png
