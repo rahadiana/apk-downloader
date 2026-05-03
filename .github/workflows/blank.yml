@@ -1,48 +1,56 @@
-name: Universal API Auditor - Anti-Halu Edition
+name: AI APK Auditor - Sofascore Direct Analysis
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
-    inputs:
-      apk_url:
-        description: 'Direct Link APK'
-        required: false
-        default: 'https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk'
 
 jobs:
-  audit-dan-test:
+  audit-sofascore:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
       - uses: actions/checkout@v4
 
+      ## 1. SETUP TOOLS
       - name: Install Forensic Tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y wget unzip python3 curl
-          # Install JADX
+          sudo apt-get install -y wget unzip python3 python3-pip jq curl
+          # JADX Decompiler (The Core Engine)
           wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
-          # Install Bun & OpenCode
-          curl -fsSL https://bun.sh/install | bash
-          echo "$HOME/.bun/bin" >> $GITHUB_PATH
 
-      - name: Download & Decompile
+      ## 2. DOWNLOAD APK (DIRECT LINK)
+      - name: Fetch Sofascore APK
         run: |
-          APK_URL="${{ github.event.inputs.apk_url }}"
-          curl -L -f -o target.apk "$APK_URL"
-          jadx target.apk -d extracted_source --no-res --show-bad-code --threads-count 4
+          echo ">>> Mendownload Sofascore APK dari KilatStorage..."
+          curl -L -o sofascore.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk"
+          if [ ! -s sofascore.apk ]; then
+            echo "❌ Download gagal atau file kosong!"
+            exit 1
+          fi
+          echo "✅ Download berhasil: $(ls -lh sofascore.apk | awk '{print $5}')"
 
-      - name: Hard Filtering (Cari yang Beneran API)
+      ## 3. DECOMPILE (BONGKAR SOURCE CODE)
+      - name: Decompile Source Code
+        run: |
+          echo ">>> Memulai JADX (DEX to Java)..."
+          jadx sofascore.apk -d extracted_source --no-res --show-bad-code --threads-count 4
+          echo "✅ Dekompilasi selesai."
+
+      ## 4. SMART CONTEXT EXTRACTION (FILTERING)
+      - name: Build AI Context
         run: |
           python3 - << 'EOF'
-          import os
+          import os, json, re
           source_dir = 'extracted_source'
-          important_files = []
-          # Cari file yang mengandung pola API Retrofit/OkHttp
-          patterns = ['@GET(', '@POST(', '@PUT(', '@DELETE(', 'interface']
+          context = {"api_logic": [], "endpoints_found": []}
           
+          # Fokus pada file yang mengandung logika networking Sofascore
+          # Biasanya menggunakan Retrofit, GSON, atau OkHttp
           for root, _, files in os.walk(source_dir):
               for file in files:
                   if file.endswith(('.java', '.kt')):
@@ -50,82 +58,71 @@ jobs:
                       try:
                           with open(path, 'r', encoding='utf-8') as f:
                               content = f.read()
-                              if any(p in content for p in patterns):
-                                  important_files.append(f"FILE: {file}\n{content[:5000]}")
+                              # Cari file yang mendefinisikan API Call atau Base URL
+                              if any(k in content for k in ['sofascore', 'api/', 'retrofit2', '@GET', '@POST']):
+                                  context["api_logic"].append({
+                                      "file": file,
+                                      "snippet": content[:8000] # Ambil 8rb karakter agar tidak overload token
+                                  })
                       except: continue
           
-          # Simpan hanya 25 file paling relevan biar AI gak overload
-          with open('context_api.txt', 'w') as f:
-              f.write("\n\n".join(important_files[:25]))
+          with open('ai_input.json', 'w') as f:
+              json.dump(context, f, indent=2)
           EOF
 
-      - name: AI Extraction (Strict Mode)
-        run: |
-          ~/.bun/bin/bun install -g opencode-ai
-          
-          echo "Tugasmu: Ekstrak daftar endpoint API dari kode berikut.
-          ATURAN KETAT:
-          1. JANGAN bikin JSON.
-          2. Tulis dalam format: METHOD | URL | HEADERS
-          3. JANGAN berikan penjelasan atau teks tambahan.
-          
-          CONTOH:
-          GET | /api/v1/users | X-Api-Key, Authorization
-          POST | /api/v1/login | Content-Type, User-Agent
-          
-          KODE SUMBER:
-          $(cat context_api.txt)" > prompt.txt
-          
-          cat prompt.txt | ~/.bun/bin/opencode run > raw_list.txt
+      ## 5. AI RUNNER (DEEP AUDIT)
+      - name: Setup Bun & AI Runner
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
 
-      - name: Python Architect & Basic Test
+      - name: AI Audit & Postman Generation
+        run: |
+          bun install -g opencode-ai
+          
+          python3 -c "
+          import json
+          ctx = open('ai_input.json').read()
+          prompt = (
+              'Kamu adalah Elite API Security Researcher.\n'
+              'Analisis kode dari APK Sofascore ini. Temukan:\n'
+              '1. Base URL (Production & Staging jika ada).\n'
+              '2. Semua Endpoint (Live Score, Team Info, Player Stats).\n'
+              '3. Header wajib (X-So-Auth, dll) dan API Keys.\n\n'
+              'Buatlah Postman Collection V2.1 dalam JSON MURNI:\n' + ctx[:35000]
+          )
+          open('prompt.txt', 'w').write(prompt)
+          "
+          opencode run "$(cat prompt.txt)" > raw_ai_output.json
+
+      ## 6. CLEANUP & PARSING JSON
+      - name: Finalize Postman Collection
         run: |
           python3 - << 'EOF'
-          import json, os
-          
-          endpoints = []
+          import re, json, sys
           try:
-              with open('raw_list.txt', 'r') as f:
-                  for line in f:
-                      if '|' in line:
-                          parts = [p.strip() for p in line.split('|')]
-                          if len(parts) >= 2:
-                              endpoints.append({
-                                  "method": parts[0],
-                                  "url": parts[1],
-                                  "headers": parts[2] if len(parts) > 2 else ""
-                              })
-          except: pass
-
-          # Buat Postman Collection
-          postman = {
-              "info": {"name": "Audit_Anti_Halu", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
-              "item": []
-          }
-
-          print("--- DAFTAR ENDPOINT DITEMUKAN ---")
-          for ep in endpoints:
-              print(f"[*] {ep['method']} - {ep['url']}")
-              
-              # Rakit Request
-              request_item = {
-                  "name": f"{ep['method']} {ep['url']}",
-                  "request": {
-                      "method": ep['method'],
-                      "header": [{"key": h.strip(), "value": "{{token}}"} for h in ep['headers'].split(',') if h.strip()],
-                      "url": {"raw": "{{baseUrl}}" + ep['url'], "host": ["{{baseUrl}}"], "path": ep['url'].lstrip('/').split('/')}
-                  }
-              }
-              postman['item'].append(request_item)
-
-          with open('Final_Audit_Result.json', 'w') as f:
-              json.dump(postman, f, indent=4)
+              content = open('raw_ai_output.json').read()
+              # Mencari blok JSON di dalam output AI
+              match = re.search(r'(\{.*\})', content, re.DOTALL)
+              if match:
+                  data = json.loads(match.group(1))
+                  with open('Sofascore_API_Audit.postman_collection.json', 'w') as f:
+                      json.dump(data, f, indent=4)
+                  print("✅ Postman Collection berhasil diekstrak!")
+              else:
+                  print("❌ AI tidak memberikan output JSON yang valid.")
+                  sys.exit(1)
+          except Exception as e:
+              print(f"❌ Error Parsing: {e}")
+              sys.exit(1)
           EOF
 
-      - name: Upload Artifact
+      ## 7. ARTIFACTS (SIMPAN HASIL)
+      - name: Upload Results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: api-list-clean
+          name: sofascore-audit-results
           path: |
-            Final_Audit_Result.json
-            raw_list.txt
+            Sofascore_API_Audit.postman_collection.json
+            ai_input.json
