@@ -1,4 +1,4 @@
-name: Extract & Test API from APK (AI Deep Analysis)
+name: Ultimate AI APK Security Auditor & Postman Generator
 
 on:
   push:
@@ -6,247 +6,147 @@ on:
   workflow_dispatch:
 
 jobs:
-  extract:
+  audit-and-test:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install deps
+      ## 1. SETUP ENVIRONMENT & TOOLS
+      - name: Install Forensic Tools (JADX & Python)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y unzip python3 python3-pip curl jq
+          sudo apt-get install -y wget unzip python3 python3-pip curl jq
+          # Install JADX Decompiler
+          wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
+          unzip jadx-1.5.0.zip -d jadx
+          sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
+          # Install Python Dependencies
+          pip install pandas requests --quiet
 
-      - name: Setup Bun
+      - name: Setup Bun & Opencode
         uses: oven-sh/setup-bun@v1
         with:
           bun-version: latest
 
-      - name: Install opencode
+      - name: Install AI Engine
         run: |
           bun install -g opencode-ai
           sleep 5
 
-      - name: Install Python deps
+      ## 2. EKSTRAKSI & DEKOMPILASI (MENDAPATKAN SOURCE CODE)
+      - name: Download & Decompile APK
         run: |
-          pip install androguard --quiet
+          curl -fL --retry 3 -o target.apk "https://raw.githubusercontent.com/rahadiana/apk-downloader/refs/heads/main/ini.apk"
+          echo ">>> Memulai dekompilasi JADX (Source Code Extraction)..."
+          jadx target.apk -d extracted_source --no-res --show-bad-code
+          echo "✅ Dekompilasi selesai."
 
-      - name: Download APK
+      ## 3. PRE-PROCESSING (MEMBANGUN KONTEKS UNTUK AI)
+      - name: Build AI Context Map
         run: |
-          curl -fL --retry 3 \
-            -o app.apk \
-            "https://raw.githubusercontent.com/rahadiana/apk-downloader/refs/heads/main/ini.apk"
-          unzip -t app.apk > /dev/null 2>&1 || { echo "❌ Tidak bisa di-unzip"; exit 1; }
-          unzip -l app.apk | grep -q "classes.dex" || { echo "❌ Tidak ada dex"; exit 1; }
-          echo "✅ APK valid — $(ls -lh app.apk | awk '{print $5}')"
-
-      - name: Extract strings from DEX (fast)
-        run: |
-          mkdir -p dex_files ai_input
-          echo ">>> Ekstrak file DEX dari APK..."
-          unzip -o app.apk "*.dex" -d dex_files/
-          ls -lh dex_files/
-          echo ">>> Parsing DEX strings..."
           python3 - << 'EOF'
-          import os, re, json, subprocess
+          import os, re, json
+          source_dir = 'extracted_source'
+          context = {"api_logic": [], "hardcoded_secrets": [], "network_files": []}
+          
+          # Mencari file yang mengandung logika networking
+          for root, _, files in os.walk(source_dir):
+              for file in files:
+                  if file.endswith(('.java', '.kt')):
+                      path = os.path.join(root, file)
+                      try:
+                          with open(path, 'r', encoding='utf-8') as f:
+                              content = f.read()
+                              if any(k in content for k in ['Retrofit', 'OkHttp', 'HttpURLConnection', 'URL']):
+                                  context["api_logic"].append({
+                                      "file": file,
+                                      "snippet": content[:7000] # Menjaga agar token AI tidak overload
+                                  })
+                              # Deteksi API Keys sederhana
+                              keys = re.findall(r'(?i)(api[_-]key|secret|token|auth).*?["\']([a-zA-Z0-9_\-\.]{10,})["\']', content)
+                              if keys:
+                                  context["hardcoded_secrets"].append({"file": file, "findings": keys})
+                      except: continue
 
-          all_strings = set()
-          dex_dir = "dex_files"
-
-          try:
-              from androguard.core.bytecodes.dvm import DalvikVMFormat
-              for dex_file in sorted(os.listdir(dex_dir)):
-                  if not dex_file.endswith(".dex"):
-                      continue
-                  print(f"  Processing {dex_file}...")
-                  try:
-                      with open(f"{dex_dir}/{dex_file}", "rb") as f:
-                          d = DalvikVMFormat(f.read())
-                      for s in d.get_strings():
-                          all_strings.add(str(s))
-                  except Exception as e:
-                      print(f"    skip: {e}")
-          except ImportError:
-              print("  Androguard tidak tersedia, pakai strings command...")
-              for dex_file in sorted(os.listdir(dex_dir)):
-                  if not dex_file.endswith(".dex"):
-                      continue
-                  result = subprocess.run(
-                      ["strings", "-n", "4", f"{dex_dir}/{dex_file}"],
-                      capture_output=True, text=True
-                  )
-                  for line in result.stdout.splitlines():
-                      all_strings.add(line.strip())
-
-          print(f"\n  Total strings: {len(all_strings)}")
-
-          urls         = set()
-          api_paths    = set()
-          base_urls    = set()
-          auth_strings = set()
-          host_strings = set()
-          interesting  = set()
-
-          URL_RE   = re.compile(r'^https?://.{4,}')
-          PATH_RE  = re.compile(r'^/(?:api|v\d|rest|service|endpoint|graphql|query|auth|oauth|user|account|finance|market|stock|quote|search|data|feed)[/\w\-\.%{}]*', re.I)
-          PATH2_RE = re.compile(r'^/[a-zA-Z][a-zA-Z0-9_\-/\.]{4,}$')
-          HOST_RE  = re.compile(r'^[a-z0-9\-]+\.[a-z]{2,}(?:\.[a-z]{2,})?$')
-
-          for s in all_strings:
-              s = s.strip()
-              if not s or len(s) < 3:
-                  continue
-              if URL_RE.match(s):
-                  urls.add(s)
-                  if not any(c in s[8:] for c in ['?', '{', ' ', '\n']):
-                      if s.count('/') <= 4:
-                          base_urls.add(s.rstrip('/'))
-              elif PATH_RE.match(s):
-                  api_paths.add(s)
-              elif PATH2_RE.match(s) and len(s) > 5:
-                  api_paths.add(s)
-              elif HOST_RE.match(s) and '.' in s:
-                  host_strings.add(s)
-              if any(kw in s.lower() for kw in [
-                  'bearer','authorization','x-api-key','api_key','apikey',
-                  'token','secret','client_id','client_secret','access_key'
-              ]):
-                  auth_strings.add(s)
-              if any(kw in s.lower() for kw in [
-                  'retrofit','okhttp','@get','@post','graphql','websocket',
-                  'baseurl','base_url','endpoint','hostname','host'
-              ]):
-                  interesting.add(s)
-
-          data = {
-              "total_strings": len(all_strings),
-              "urls": sorted(urls),
-              "base_urls": sorted(base_urls),
-              "api_paths": sorted(api_paths),
-              "hosts": sorted(host_strings),
-              "auth_strings": sorted(auth_strings),
-              "interesting": sorted(interesting),
-          }
-          with open("ai_input/extracted.json", "w") as f:
-              json.dump(data, f, indent=2)
-
-          context = []
-          context.append("=== BASE URLs ===")
-          context.extend(sorted(base_urls)[:100])
-          context.append("\n=== ALL URLs ===")
-          context.extend(sorted(urls)[:300])
-          context.append("\n=== API PATHS ===")
-          context.extend(sorted(api_paths)[:500])
-          context.append("\n=== HOSTS ===")
-          context.extend(sorted(host_strings)[:100])
-          context.append("\n=== AUTH-RELATED STRINGS ===")
-          context.extend(sorted(auth_strings)[:100])
-          context.append("\n=== INTERESTING STRINGS ===")
-          context.extend(sorted(interesting)[:200])
-
-          full = "\n".join(context)
-          if len(full) > 80000:
-              full = full[:80000]
-          with open("ai_input/code_context.txt", "w") as f:
-              f.write(full)
+          with open('ai_input_context.json', 'w') as f:
+              json.dump(context, f, indent=2)
           EOF
 
-      - name: AI Round 1 - Deep Endpoint Extraction
+      ## 4. AI AUDIT ROUND 1: MAPPING & RECONSTRUCTION
+      - name: AI Round 1 - Architecture Mapping
         run: |
           python3 -c "
           import json
-          code = open('ai_input/code_context.txt').read()
-          prompt = (
-            'Kamu adalah elite mobile security researcher.\n\n'
-            'DATA EKSTRAKSI:\n' + code + '\n\n'
-            'LAKUKAN ANALISIS MENDALAM:\n'
-            '1. Identifikasi base URL & framework.\n'
-            '2. Rekonstruksi endpoint (Base + Path).\n'
-            '3. Identifikasi Auth header/keys.\n\n'
-            'OUTPUT JSON murni:\n'
-            '{\"app_package\":\"\",\"base_urls\":{\"production\":\"\"},\"endpoints\":[{\"method\":\"GET\",\"full_url\":\"\",\"requires_auth\":false}]}'
-          )
-          open('ai_input/prompt_round1.txt','w').write(prompt)
+          ctx = open('ai_input_context.json').read()
+          prompt = f'Kamu adalah Senior Security Engineer. Analisis source code APK ini:\n{ctx[:35000]}\n\nIdentifikasi: 1. Base URL 2. Semua Endpoint 3. Auth Mechanism. Output dalam JSON murni.'
+          open('prompt_r1.txt', 'w').write(prompt)
           "
-          opencode run "$(cat ai_input/prompt_round1.txt)" > ai_round1_raw.txt 2>&1
+          opencode run "$(cat prompt_r1.txt)" > mapping_report.json
 
-          python3 - << 'PYEOF'
-          import re, json
-          try:
-              raw = open("ai_round1_raw.txt").read()
-              match = re.search(r'\{.*\}', raw, re.DOTALL)
-              if match:
-                  data = json.loads(match.group())
-                  json.dump(data, open("ai_endpoints.json","w"), indent=2)
-              else:
-                  raise ValueError("No JSON found")
-          except:
-              json.dump({"endpoints":[]}, open("ai_endpoints.json","w"))
-          PYEOF
-
-      - name: AI Round 2 - Build Test Cases
+      ## 5. AI AUDIT ROUND 2: SECURITY TESTING & CURL GENERATION
+      - name: AI Round 2 - Generate Test Cases
         run: |
           python3 -c "
-          import json
-          eps = open('ai_endpoints.json').read()
-          prompt = 'Berdasarkan data ini: ' + eps + ' buat list curl command siap pakai dalam format JSON {\"test_cases\":[{\"name\":\"\",\"curl_command\":\"\"}]}. Gunakan symbol AAPL/BTC-USD untuk finance.'
-          open('ai_input/prompt_round2.txt','w').write(prompt)
+          mapping = open('mapping_report.json').read()
+          prompt = f'Berdasarkan mapping ini: {mapping}\n\nBuat daftar curl command untuk testing setiap endpoint. Sertakan header yang diperlukan. Output dalam JSON: {{\"test_cases\": []}}'
+          open('prompt_r2.txt', 'w').write(prompt)
           "
-          opencode run "$(cat ai_input/prompt_round2.txt)" > ai_round2_raw.txt 2>&1
+          opencode run "$(cat prompt_r2.txt)" > test_cases.json
 
-          python3 - << 'PYEOF'
-          import re, json
-          try:
-              raw = open("ai_round2_raw.txt").read()
-              match = re.search(r'\{.*\}', raw, re.DOTALL)
-              if match:
-                  json.dump(json.loads(match.group()), open("ai_test_cases.json","w"), indent=2)
-          except:
-              json.dump({"test_cases":[]}, open("ai_test_cases.json","w"))
-          PYEOF
-
-      - name: Execute API Tests
+      ## 6. EKSEKUSI PENGUJIAN OTOMATIS
+      - name: Execute Live API Tests
         run: |
           python3 - << 'PYEOF'
-          import json, subprocess, time
+          import json, subprocess
           try:
-              cases = json.load(open("ai_test_cases.json")).get("test_cases", [])
+              data = json.load(open('test_cases.json'))
+              # Mencari blok test_cases jika AI memberikan teks tambahan
+              cases = data.get('test_cases', []) if isinstance(data, dict) else []
               results = []
               for case in cases:
-                  cmd = case.get("curl_command")
-                  if not cmd or "[TOKEN]" in cmd: continue
-                  print(f"Testing: {case['name']}")
-                  proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
-                  results.append({
-                      "name": case['name'],
-                      "status_code": proc.stdout.split()[-1] if proc.stdout else "ERR",
-                      "success": proc.returncode == 0
-                  })
-              json.dump({"results": results}, open("test_results.json","w"), indent=2)
-          except Exception as e:
-              print(f"Error: {e}")
+                  cmd = case.get('curl_command')
+                  if cmd and "[TOKEN]" not in cmd:
+                      print(f"Running test: {case.get('name')}")
+                      res = subprocess.run(cmd + " -s -w ' %{http_code}'", shell=True, capture_output=True, text=True)
+                      results.append({"name": case.get('name'), "output": res.stdout})
+              json.dump(results, open('test_results.json', 'w'))
+          except: print("⚠️ Gagal menjalankan test otomatis")
           PYEOF
 
-      - name: AI Round 3 - Final Report
+      ## 7. AI ROUND 3: GENERATE POSTMAN COLLECTION
+      - name: AI Round 3 - Postman Collection Generator
         run: |
           python3 -c "
-          import json
-          res = open('test_results.json').read()
-          prompt = 'Buat laporan eksekutif Markdown dalam Bahasa Indonesia berdasarkan hasil test API ini: ' + res
-          open('ai_input/prompt_round3.txt','w').write(prompt)
+          mapping = open('mapping_report.json').read()
+          prompt = f'Ubah data API ini menjadi Postman Collection V2.1 JSON murni:\n{mapping}\n\nGunakan variabel {{{{baseUrl}}}}. Kelompokkan berdasarkan fungsionalitas.'
+          open('prompt_postman.txt', 'w').write(prompt)
           "
-          opencode run "$(cat ai_input/prompt_round3.txt)" > final_report.md 2>&1
+          opencode run "$(cat prompt_postman.txt)" > raw_postman.json
+          
+          # Cleanup JSON Postman agar valid
+          python3 -c "
+          import re, json
+          raw = open('raw_postman.json').read()
+          match = re.search(r'\{.*\}', raw, re.DOTALL)
+          if match:
+              with open('APK_Audit_Collection.json', 'w') as f:
+                  json.dump(json.loads(match.group()), f, indent=4)
+          "
 
-      - name: Upload Artifacts
+      ## 8. FINAL REPORT & ARTIFACTS
+      - name: Upload Audit Results
         uses: actions/upload-artifact@v4
         with:
-          name: api-analysis-report
+          name: Full-API-Audit-Package
           path: |
-            *.json
-            *.md
+            APK_Audit_Collection.json
+            mapping_report.json
+            test_results.json
 
       - name: GitHub Summary
         run: |
-          echo "# 🛡️ API Analysis Summary" >> $GITHUB_STEP_SUMMARY
-          cat final_report.md >> $GITHUB_STEP_SUMMARY
+          echo "## 🛡️ APK API Audit Berhasil" >> $GITHUB_STEP_SUMMARY
+          echo "Konteks source code telah dianalisis oleh AI." >> $GITHUB_STEP_SUMMARY
+          echo "Silakan download Postman Collection di bagian Artifacts." >> $GITHUB_STEP_SUMMARY
