@@ -14,26 +14,21 @@ jobs:
 
       - name: Download APK
         run: curl -L -o app.apk https://finance.en.uptodown.com/android/download && file app.apk
-      
-      - name: Install JADX
+
+      - name: Install JADX (dynamic)
         run: |
           set -e
       
-          URL="https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip"
+          URL=$(curl -s https://api.github.com/repos/skylot/jadx/releases/latest \
+            | grep browser_download_url \
+            | grep linux \
+            | cut -d '"' -f 4)
       
-          curl -fL --retry 3 --retry-delay 2 -o jadx.zip "$URL"
+          echo "Downloading: $URL"
       
-          echo "=== FILE INFO ==="
-          ls -lh jadx.zip
+          curl -fL --retry 3 -o jadx.zip "$URL"
+      
           file jadx.zip
-      
-          # validasi minimal ukuran (zip normal puluhan MB)
-          size=$(stat -c%s jadx.zip)
-          if [ "$size" -lt 1000000 ]; then
-            echo "Download gagal / file terlalu kecil"
-            exit 1
-          fi
-      
           unzip -q jadx.zip
 
       - name: Decompile
