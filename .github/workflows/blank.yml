@@ -1,4 +1,4 @@
-name: Universal AI APK Auditor - The Clean Version
+name: Universal API Auditor - Anti-Halu Edition
 
 on:
   push:
@@ -11,98 +11,121 @@ on:
         default: 'https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk'
 
 jobs:
-  clean-audit:
+  audit-dan-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      ## 1. SETUP TOOLS
-      - name: Install Tools
+      - name: Install Forensic Tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y wget unzip python3 curl
-          # JADX
+          # Install JADX
           wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
-          # Bun & OpenCode
+          # Install Bun & OpenCode
           curl -fsSL https://bun.sh/install | bash
           echo "$HOME/.bun/bin" >> $GITHUB_PATH
 
-      ## 2. DOWNLOAD & BONGKAR
       - name: Download & Decompile
         run: |
           APK_URL="${{ github.event.inputs.apk_url }}"
-          [ -z "$APK_URL" ] && APK_URL="https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk"
           curl -L -f -o target.apk "$APK_URL"
           jadx target.apk -d extracted_source --no-res --show-bad-code --threads-count 4
 
-      ## 3. FILTER FILE (BIAR GAK KEPENUHAN)
-      - name: Select Core Files
+      - name: Hard Filtering (Cari yang Beneran API)
         run: |
           python3 - << 'EOF'
-          import os, json
+          import os
           source_dir = 'extracted_source'
-          context = []
-          patterns = ['retrofit', 'okhttp', '@GET', '@POST', 'Interceptor', 'X-So-']
+          important_files = []
+          # Cari file yang mengandung pola API Retrofit/OkHttp
+          patterns = ['@GET(', '@POST(', '@PUT(', '@DELETE(', 'interface']
           
           for root, _, files in os.walk(source_dir):
               for file in files:
                   if file.endswith(('.java', '.kt')):
+                      path = os.path.join(root, file)
                       try:
-                          with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
+                          with open(path, 'r', encoding='utf-8') as f:
                               content = f.read()
-                              if any(k in content for k in patterns):
-                                  context.append(f"--- FILE: {file} ---\n{content[:6000]}")
+                              if any(p in content for p in patterns):
+                                  important_files.append(f"FILE: {file}\n{content[:5000]}")
                       except: continue
           
-          # Ambil 30 file paling penting biar AI fokus
-          with open('clean_context.txt', 'w') as f:
-              f.write("\n".join(context[:30]))
+          # Simpan hanya 25 file paling relevan biar AI gak overload
+          with open('context_api.txt', 'w') as f:
+              f.write("\n\n".join(important_files[:25]))
           EOF
 
-      ## 4. SINGLE AI PASS (MINTA JSON RAPIH)
-      - name: AI Audit
+      - name: AI Extraction (Strict Mode)
         run: |
           ~/.bun/bin/bun install -g opencode-ai
           
-          echo "Tugasmu adalah menganalisis kode sumber APK ini dan membuat Postman Collection V2.1.
+          echo "Tugasmu: Ekstrak daftar endpoint API dari kode berikut.
+          ATURAN KETAT:
+          1. JANGAN bikin JSON.
+          2. Tulis dalam format: METHOD | URL | HEADERS
+          3. JANGAN berikan penjelasan atau teks tambahan.
           
-          INSTRUKSI:
-          1. Temukan Base URL dan semua Endpoint API.
-          2. Kelompokkan ke dalam FOLDER yang logis.
-          3. Gunakan variabel {{baseUrl}} untuk semua request.
-          4. Masukkan Header yang ditemukan (seperti User-Agent, X-So-Auth, dll).
-          5. OUTPUT HARUS HANYA JSON VALID (POSTMAN COLLECTION). JANGAN ADA PENJELASAN TEKS.
+          CONTOH:
+          GET | /api/v1/users | X-Api-Key, Authorization
+          POST | /api/v1/login | Content-Type, User-Agent
           
           KODE SUMBER:
-          $(cat clean_context.txt)" > clean_prompt.txt
+          $(cat context_api.txt)" > prompt.txt
           
-          cat clean_prompt.txt | ~/.bun/bin/opencode run > result.json
+          cat prompt.txt | ~/.bun/bin/opencode run > raw_list.txt
 
-      ## 5. FINAL POLISH (PASTIKAN JSON VALID)
-      - name: Final Validation
+      - name: Python Architect & Basic Test
         run: |
           python3 - << 'EOF'
-          import json, re
+          import json, os
+          
+          endpoints = []
           try:
-              content = open('result.json').read()
-              # Bersihkan teks sampah kalau AI curhat
-              match = re.search(r'(\{.*\})', content, re.DOTALL)
-              if match:
-                  data = json.loads(match.group(1))
-                  with open('Final_Audit_Result.json', 'w') as f:
-                      json.dump(data, f, indent=4)
-                  print("✅ JSON Berhasil Dirapikan!")
-              else:
-                  print("❌ AI Gagal ngasih JSON.")
-          except Exception as e:
-              print(f"❌ Error: {e}")
+              with open('raw_list.txt', 'r') as f:
+                  for line in f:
+                      if '|' in line:
+                          parts = [p.strip() for p in line.split('|')]
+                          if len(parts) >= 2:
+                              endpoints.append({
+                                  "method": parts[0],
+                                  "url": parts[1],
+                                  "headers": parts[2] if len(parts) > 2 else ""
+                              })
+          except: pass
+
+          # Buat Postman Collection
+          postman = {
+              "info": {"name": "Audit_Anti_Halu", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+              "item": []
+          }
+
+          print("--- DAFTAR ENDPOINT DITEMUKAN ---")
+          for ep in endpoints:
+              print(f"[*] {ep['method']} - {ep['url']}")
+              
+              # Rakit Request
+              request_item = {
+                  "name": f"{ep['method']} {ep['url']}",
+                  "request": {
+                      "method": ep['method'],
+                      "header": [{"key": h.strip(), "value": "{{token}}"} for h in ep['headers'].split(',') if h.strip()],
+                      "url": {"raw": "{{baseUrl}}" + ep['url'], "host": ["{{baseUrl}}"], "path": ep['url'].lstrip('/').split('/')}
+                  }
+              }
+              postman['item'].append(request_item)
+
+          with open('Final_Audit_Result.json', 'w') as f:
+              json.dump(postman, f, indent=4)
           EOF
 
-      ## 6. SAVE RESULT
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: api-audit-rapih
-          path: Final_Audit_Result.json
+          name: api-list-clean
+          path: |
+            Final_Audit_Result.json
+            raw_list.txt
