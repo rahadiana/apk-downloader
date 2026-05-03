@@ -17,11 +17,9 @@ jobs:
       - name: Download APK
         run: |
           curl -L -o app.apk "https://finance.en.uptodown.com/android/download"
-
           echo "=== FILE INFO ==="
           file app.apk
           ls -lh
-
           file app.apk | grep "Zip archive" || (echo "Bukan APK" && exit 1)
 
       - name: Install JADX
@@ -34,35 +32,17 @@ jobs:
           JADX_DIR=$(ls -d jadx-* | head -n 1)
           $JADX_DIR/bin/jadx -d out app.apk
 
-      # 🔥 FIX DI SINI (NO HEREDOC)
-      - name: Create extractor script
+      # 🔥 Extract endpoint TANPA heredoc Python
+      - name: Extract endpoints
         run: |
-          cat << 'EOF' > extract.py
-import os, re, json
+          grep -RhoE 'https?://[^" >]+' out | sort -u > urls.txt || true
+          echo "TOTAL URL:"
+          wc -l urls.txt
+          head -n 50 urls.txt
 
-urls = set()
-
-for root, _, files in os.walk("out"):
-    for f in files:
-        if f.endswith((".java", ".kt")):
-            try:
-                with open(os.path.join(root, f), errors="ignore") as fh:
-                    txt = fh.read()
-                    urls.update(re.findall(r'https?://[^\\s"\\'<>]+', txt))
-            except:
-                pass
-
-urls = sorted(urls)
-
-with open("endpoints.json", "w") as f:
-    json.dump({"count": len(urls), "urls": urls}, f, indent=2)
-
-print("FOUND:", len(urls))
-EOF
-
-      - name: Run extractor
+      - name: Convert to JSON
         run: |
-          python3 extract.py
+          python3 -c "import json; print(json.dumps({'urls':[l.strip() for l in open('urls.txt')]}))" > endpoints.json
 
       - name: Upload result
         uses: actions/upload-artifact@v4
