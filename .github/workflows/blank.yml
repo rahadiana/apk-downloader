@@ -16,79 +16,13 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl unzip python3 default-jre-headless tor proxychains4
+          sudo apt-get install -y unzip python3 default-jre-headless
 
-      # Pakai Tor sebagai proxy — IP tidak kelihatan sebagai datacenter
-      - name: Start Tor proxy
+      - name: Download APK
         run: |
-          sudo service tor start
-          sleep 5
-          # Test tor jalan
-          curl --socks5 127.0.0.1:9050 https://check.torproject.org/api/ip | python3 -m json.tool
-
-      - name: Download APK (multi-source via Tor)
-        run: |
-          set -e
-          PKG="com.yahoo.mobile.client.android.finance"
-          PROXY="--socks5-hostname 127.0.0.1:9050"
-
-          try_apkcombo() {
-            echo ">>> Mencoba APKCombo..."
-            PAGE=$(curl -fsSL $PROXY \
-              -A "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36" \
-              -H "Accept: text/html,application/xhtml+xml" \
-              -H "Accept-Language: en-US,en;q=0.9" \
-              "https://apkcombo.com/yahoo-finance/$PKG/download/apk")
-
-            APK_URL=$(echo "$PAGE" | grep -oE 'https://[^"]+\.apk[^"]*' | grep -v 'thumb\|icon\|img' | head -1)
-            [ -z "$APK_URL" ] && return 1
-
-            echo "URL: $APK_URL"
-            curl -fL $PROXY \
-              -A "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36" \
-              --retry 3 -o app.apk "$APK_URL"
-          }
-
-          try_apkpure() {
-            echo ">>> Mencoba APKPure..."
-            # APKPure API v3
-            VER_JSON=$(curl -fsSL $PROXY \
-              -H "X-Cv: 3172501" \
-              -H "X-Sv: 2" \
-              "https://api.pureapk.com/m/v3/cms/app/version?package_name=$PKG&hl=en")
-
-            APK_URL=$(echo "$VER_JSON" | python3 -c "
-          import json,sys
-          d=json.load(sys.stdin)
-          print(d.get('apk',{}).get('download_url',''))
-          " 2>/dev/null)
-            [ -z "$APK_URL" ] && return 1
-
-            echo "URL: $APK_URL"
-            curl -fL $PROXY --retry 3 -o app.apk "$APK_URL"
-          }
-
-          try_apkdone() {
-            echo ">>> Mencoba APKDone..."
-            PAGE=$(curl -fsSL $PROXY \
-              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-              "https://apkdone.com/$PKG/")
-
-            APK_URL=$(echo "$PAGE" | grep -oE 'https://[^"]+\.apk' | head -1)
-            [ -z "$APK_URL" ] && return 1
-
-            echo "URL: $APK_URL"
-            curl -fL $PROXY --retry 3 -o app.apk "$APK_URL"
-          }
-
-          # Coba satu per satu, berhenti kalau berhasil
-          try_apkcombo || try_apkpure || try_apkdone || {
-            echo "❌ Semua sumber gagal"
-            exit 1
-          }
-
-          # Validasi hasil
-          echo "=== APK INFO ==="
+          curl -fL --retry 3 \
+            -o app.apk \
+            "https://raw.githubusercontent.com/rahadiana/apk-downloader/refs/heads/main/ini.apk"
           ls -lh app.apk
           file app.apk | grep -q "Zip archive" || { echo "❌ Bukan APK valid"; exit 1; }
           unzip -l app.apk | grep -q "classes.dex" || { echo "❌ Tidak ada dex"; exit 1; }
@@ -139,3 +73,12 @@ jobs:
           path: |
             endpoints.json
             urls.txt
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "## 📊 Hasil Ekstraksi" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total URL:** $(wc -l < urls.txt)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          head -20 urls.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
