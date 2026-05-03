@@ -1,4 +1,4 @@
-name: AI APK Auditor - Multi-Source Stable Mode
+name: AI APK Auditor - Sofascore Direct Analysis
 
 on:
   push:
@@ -6,147 +6,123 @@ on:
   workflow_dispatch:
 
 jobs:
-  audit-process:
+  audit-sofascore:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Forensic Tools & Playwright
+      ## 1. SETUP TOOLS
+      - name: Install Forensic Tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y wget unzip python3 python3-pip jq
+          sudo apt-get install -y wget unzip python3 python3-pip jq curl
+          # JADX Decompiler (The Core Engine)
           wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
-          pip install playwright
-          playwright install chromium --with-deps
 
-      - name: Download APK via Resilient Script
+      ## 2. DOWNLOAD APK (DIRECT LINK)
+      - name: Fetch Sofascore APK
         run: |
-          python3 - << 'EOF'
-          import asyncio
-          import sys
-          from playwright.async_api import async_playwright
+          echo ">>> Mendownload Sofascore APK dari KilatStorage..."
+          curl -L -o sofascore.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk"
+          if [ ! -s sofascore.apk ]; then
+            echo "❌ Download gagal atau file kosong!"
+            exit 1
+          fi
+          echo "✅ Download berhasil: $(ls -lh sofascore.apk | awk '{print $5}')"
 
-          async def download_apk():
-              async with async_playwright() as p:
-                  browser = await p.chromium.launch(headless=True)
-                  # Gunakan profil yang lebih mirip manusia
-                  context = await browser.new_context(
-                      viewport={'width': 1280, 'height': 800},
-                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                  )
-                  page = await context.new_page()
-                  
-                  # SOURCE 1: APK.SUPPORT (Seringkali lebih ramah ke GitHub IP)
-                  print(">>> Mencoba Source 1: APK.Support...")
-                  try:
-                      await page.goto("https://apk.support/download-app/mobile.android.tribun", timeout=60000)
-                      # Tunggu link download muncul secara dinamis
-                      await page.wait_for_selector("a.btn-download", timeout=20000)
-                      async with page.expect_download() as download_info:
-                          await page.click("a.btn-download")
-                      download = await download_info.value
-                      await download.save_as("tribun.apk")
-                      print("✅ Berhasil via Source 1!")
-                      return True
-                  except Exception as e:
-                      print(f"⚠️ Source 1 Gagal: {e}")
-
-                  # SOURCE 2: APK-DL (Direct Logic)
-                  print(">>> Mencoba Source 2: APK-DL...")
-                  try:
-                      await page.goto("https://apk-dl.com/tribunnews-indonesia-local-news/mobile.android.tribun", timeout=60000)
-                      # Jika tombol download-btn tidak ada, cari alternatif selector
-                      await page.wait_for_selector("a", timeout=10000) 
-                      # Cari link yang mengandung kata 'download' secara paksa
-                      links = await page.query_selector_all("a")
-                      for link in links:
-                          text = await link.inner_text()
-                          if "download" in text.lower():
-                              await link.click()
-                              break
-                      
-                      await page.wait_for_selector("a.mdl-button", timeout=30000)
-                      async with page.expect_download() as download_info:
-                          await page.click("a.mdl-button")
-                      download = await download_info.value
-                      await download.save_as("tribun.apk")
-                      print("✅ Berhasil via Source 2!")
-                      return True
-                  except Exception as e:
-                      print(f"⚠️ Source 2 Gagal: {e}")
-                  
-                  await browser.close()
-                  return False
-
-          if not asyncio.run(download_apk()):
-              print("❌ SEMUA SOURCE GAGAL. Gunakan Manual Upload tribun.apk ke repo.")
-              sys.exit(1)
-          EOF
-
+      ## 3. DECOMPILE (BONGKAR SOURCE CODE)
       - name: Decompile Source Code
         run: |
-          jadx tribun.apk -d extracted_source --no-res --show-bad-code --threads-count 4
+          echo ">>> Memulai JADX (DEX to Java)..."
+          jadx sofascore.apk -d extracted_source --no-res --show-bad-code --threads-count 4
+          echo "✅ Dekompilasi selesai."
 
+      ## 4. SMART CONTEXT EXTRACTION (FILTERING)
       - name: Build AI Context
         run: |
           python3 - << 'EOF'
-          import os, json
+          import os, json, re
           source_dir = 'extracted_source'
-          context = {"api_logic": []}
-          # Ekstraksi cerdas: hanya ambil file yang kemungkinan besar berisi API
+          context = {"api_logic": [], "endpoints_found": []}
+          
+          # Fokus pada file yang mengandung logika networking Sofascore
+          # Biasanya menggunakan Retrofit, GSON, atau OkHttp
           for root, _, files in os.walk(source_dir):
               for file in files:
                   if file.endswith(('.java', '.kt')):
-                      if any(k in file.lower() for k in ['api', 'service', 'network', 'client', 'repository']):
-                          path = os.path.join(root, file)
-                          try:
-                              with open(path, 'r', encoding='utf-8') as f:
-                                  content = f.read()
-                                  if 'tribun' in content.lower():
-                                      context["api_logic"].append({"file": file, "snippet": content[:8000]})
-                          except: continue
+                      path = os.path.join(root, file)
+                      try:
+                          with open(path, 'r', encoding='utf-8') as f:
+                              content = f.read()
+                              # Cari file yang mendefinisikan API Call atau Base URL
+                              if any(k in content for k in ['sofascore', 'api/', 'retrofit2', '@GET', '@POST']):
+                                  context["api_logic"].append({
+                                      "file": file,
+                                      "snippet": content[:8000] # Ambil 8rb karakter agar tidak overload token
+                                  })
+                      except: continue
+          
           with open('ai_input.json', 'w') as f:
               json.dump(context, f, indent=2)
           EOF
 
-      - name: AI Runner - Deep Audit
+      ## 5. AI RUNNER (DEEP AUDIT)
+      - name: Setup Bun & AI Runner
         uses: oven-sh/setup-bun@v1
         with:
           bun-version: latest
 
-      - name: AI Audit & Postman Generate
+      - name: AI Audit & Postman Generation
         run: |
           bun install -g opencode-ai
+          
           python3 -c "
+          import json
           ctx = open('ai_input.json').read()
-          prompt = f'Kamu adalah Senior Security Auditor. Analisis kode Tribunnews ini. Cari Base URL dan Endpoint. Buat Postman Collection V2.1 JSON Murni:\n{ctx[:35000]}'
+          prompt = (
+              'Kamu adalah Elite API Security Researcher.\n'
+              'Analisis kode dari APK Sofascore ini. Temukan:\n'
+              '1. Base URL (Production & Staging jika ada).\n'
+              '2. Semua Endpoint (Live Score, Team Info, Player Stats).\n'
+              '3. Header wajib (X-So-Auth, dll) dan API Keys.\n\n'
+              'Buatlah Postman Collection V2.1 dalam JSON MURNI:\n' + ctx[:35000]
+          )
           open('prompt.txt', 'w').write(prompt)
           "
-          opencode run "$(cat prompt.txt)" > raw_output.json
+          opencode run "$(cat prompt.txt)" > raw_ai_output.json
 
+      ## 6. CLEANUP & PARSING JSON
       - name: Finalize Postman Collection
         run: |
           python3 - << 'EOF'
           import re, json, sys
           try:
-              content = open('raw_output.json').read()
+              content = open('raw_ai_output.json').read()
+              # Mencari blok JSON di dalam output AI
               match = re.search(r'(\{.*\})', content, re.DOTALL)
               if match:
                   data = json.loads(match.group(1))
-                  with open('Tribun_API_Audit.json', 'w') as f:
+                  with open('Sofascore_API_Audit.postman_collection.json', 'w') as f:
                       json.dump(data, f, indent=4)
-                  print("✅ Selesai!")
-              else: sys.exit(1)
-          except: sys.exit(1)
+                  print("✅ Postman Collection berhasil diekstrak!")
+              else:
+                  print("❌ AI tidak memberikan output JSON yang valid.")
+                  sys.exit(1)
+          except Exception as e:
+              print(f"❌ Error Parsing: {e}")
+              sys.exit(1)
           EOF
 
-      - name: Save Results
+      ## 7. ARTIFACTS (SIMPAN HASIL)
+      - name: Upload Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: audit-results-tribun
-          path: Tribun_API_Audit.json
+          name: sofascore-audit-results
+          path: |
+            Sofascore_API_Audit.postman_collection.json
+            ai_input.json
