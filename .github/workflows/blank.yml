@@ -1,0 +1,67 @@
+name: Dump APK via Emulator
+
+on:
+  workflow_dispatch:
+
+jobs:
+  emulator:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y wget unzip openjdk-17-jdk
+
+      - name: Setup Android SDK
+        run: |
+          mkdir -p $HOME/android-sdk
+          cd $HOME/android-sdk
+
+          wget https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip commandlinetools-linux-*.zip
+
+          mkdir -p cmdline-tools/latest
+          mv cmdline-tools/* cmdline-tools/latest/
+
+          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "PATH=$PATH:$HOME/android-sdk/cmdline-tools/latest/bin:$HOME/android-sdk/platform-tools:$HOME/android-sdk/emulator" >> $GITHUB_ENV
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platform-tools" "emulator" "platforms;android-30" "system-images;android-30;google_apis;x86_64"
+
+      - name: Create AVD
+        run: |
+          echo "no" | avdmanager create avd -n test -k "system-images;android-30;google_apis;x86_64"
+
+      - name: Start emulator
+        run: |
+          nohup emulator -avd test -no-window -no-audio -no-boot-anim &
+          adb wait-for-device
+
+      - name: Wait boot
+        run: |
+          adb shell 'while [[ -z $(getprop sys.boot_completed) ]]; do sleep 2; done;'
+
+      - name: Install APK (fallback)
+        run: |
+          wget -O app.apk "https://finance.en.uptodown.com/android/download"
+          adb install app.apk
+
+      - name: Dump APK path
+        run: |
+          adb shell pm path com.yahoo.mobile.client.android.finance
+
+      - name: Pull APK
+        run: |
+          adb shell pm path com.yahoo.mobile.client.android.finance | sed 's/package://g' | while read line; do
+            adb pull "$line"
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dumped-apk
+          path: "*.apk"
