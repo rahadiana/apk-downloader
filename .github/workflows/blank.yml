@@ -14,7 +14,7 @@ jobs:
 
       - name: Download APK
         run: curl -L -o app.apk https://finance.en.uptodown.com/android/download && file app.apk
-
+    
       - name: Install JADX
         run: |
           set -e
@@ -28,22 +28,26 @@ jobs:
           ls -lh jadx.zip
           file jadx.zip
       
-          # validasi size (minimal 5MB)
-          size=$(stat -c%s jadx.zip)
-          if [ "$size" -lt 5000000 ]; then
-            echo "Download gagal / file rusak"
-            exit 1
-          fi
+          # validasi file (harus zip + >5MB)
+          file jadx.zip | grep -q "Zip archive" || (echo "Bukan zip" && exit 1)
+          [ $(stat -c%s jadx.zip) -gt 5000000 ] || (echo "File terlalu kecil" && exit 1)
       
           unzip -q jadx.zip
       
-          echo "=== AFTER UNZIP ==="
+          echo "=== CONTENT ==="
           ls -lah
-
-      - name: Decompile
+      
+          # pastikan binary ada
+          test -f jadx-1.5.0/bin/jadx || (echo "jadx tidak ditemukan" && exit 1)
+      
+      - name: Decompile APK
         run: |
-          JADX_DIR=$(ls -d jadx-* | head -n 1)
-          $JADX_DIR/bin/jadx -d out app.apk
+          set -e
+      
+          ./jadx-1.5.0/bin/jadx -d out app.apk
+      
+          echo "=== RESULT ==="
+          ls -lah out
 
       - name: Extract endpoints
         run: grep -RhoE "https?://[^\" ]+" out | sort -u > urls.txt || true
