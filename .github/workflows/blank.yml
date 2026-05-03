@@ -1,8 +1,7 @@
 name: Dump APK via Emulator
 
-on:
-  workflow_dispatch:
-
+on: 
+  push:
 jobs:
   emulator:
     runs-on: ubuntu-latest
