@@ -1,4 +1,4 @@
-name: AI APK Auditor - Fixed Web Navigation
+name: AI APK Auditor - Multi-Source Stable Mode
 
 on:
   push:
@@ -23,53 +23,68 @@ jobs:
           pip install playwright
           playwright install chromium --with-deps
 
-      - name: Download APK via APK-DL (Force Mode)
+      - name: Download APK via Resilient Script
         run: |
           python3 - << 'EOF'
           import asyncio
+          import sys
           from playwright.async_api import async_playwright
 
-          async def run():
+          async def download_apk():
               async with async_playwright() as p:
                   browser = await p.chromium.launch(headless=True)
-                  # Gunakan User Agent Mobile agar website lebih ringan
+                  # Gunakan profil yang lebih mirip manusia
                   context = await browser.new_context(
-                      user_agent="Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.162 Mobile Safari/537.36"
+                      viewport={'width': 1280, 'height': 800},
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
                   )
                   page = await context.new_page()
                   
-                  print(">>> Membuka Downloader APK-DL...")
+                  # SOURCE 1: APK.SUPPORT (Seringkali lebih ramah ke GitHub IP)
+                  print(">>> Mencoba Source 1: APK.Support...")
                   try:
-                      # Navigasi langsung ke halaman package Tribunnews
-                      target_url = "https://apk-dl.com/tribunnews-indonesia-local-news/mobile.android.tribun"
-                      await page.goto(target_url, timeout=60000)
-                      
-                      print(">>> Mencari tombol download...")
-                      # Tunggu tombol yang mengarah ke halaman download
-                      download_page_selector = "a.download-btn"
-                      await page.wait_for_selector(download_page_selector)
-                      await page.click(download_page_selector)
-
-                      # Tunggu tombol generate/final download
-                      final_btn = "a.mdl-button--colored"
-                      await page.wait_for_selector(final_btn, timeout=60000)
-                      
-                      print(">>> Mengunduh file...")
+                      await page.goto("https://apk.support/download-app/mobile.android.tribun", timeout=60000)
+                      # Tunggu link download muncul secara dinamis
+                      await page.wait_for_selector("a.btn-download", timeout=20000)
                       async with page.expect_download() as download_info:
-                          await page.click(final_btn)
-                      
+                          await page.click("a.btn-download")
                       download = await download_info.value
                       await download.save_as("tribun.apk")
-                      print(f"✅ Berhasil mengunduh APK!")
-                      
+                      print("✅ Berhasil via Source 1!")
+                      return True
                   except Exception as e:
-                      print(f"❌ Gagal di tengah jalan: {e}")
-                      await page.screenshot(path="error_debug.png")
-                      raise e
-                  finally:
-                      await browser.close()
+                      print(f"⚠️ Source 1 Gagal: {e}")
 
-          asyncio.run(run())
+                  # SOURCE 2: APK-DL (Direct Logic)
+                  print(">>> Mencoba Source 2: APK-DL...")
+                  try:
+                      await page.goto("https://apk-dl.com/tribunnews-indonesia-local-news/mobile.android.tribun", timeout=60000)
+                      # Jika tombol download-btn tidak ada, cari alternatif selector
+                      await page.wait_for_selector("a", timeout=10000) 
+                      # Cari link yang mengandung kata 'download' secara paksa
+                      links = await page.query_selector_all("a")
+                      for link in links:
+                          text = await link.inner_text()
+                          if "download" in text.lower():
+                              await link.click()
+                              break
+                      
+                      await page.wait_for_selector("a.mdl-button", timeout=30000)
+                      async with page.expect_download() as download_info:
+                          await page.click("a.mdl-button")
+                      download = await download_info.value
+                      await download.save_as("tribun.apk")
+                      print("✅ Berhasil via Source 2!")
+                      return True
+                  except Exception as e:
+                      print(f"⚠️ Source 2 Gagal: {e}")
+                  
+                  await browser.close()
+                  return False
+
+          if not asyncio.run(download_apk()):
+              print("❌ SEMUA SOURCE GAGAL. Gunakan Manual Upload tribun.apk ke repo.")
+              sys.exit(1)
           EOF
 
       - name: Decompile Source Code
@@ -82,32 +97,33 @@ jobs:
           import os, json
           source_dir = 'extracted_source'
           context = {"api_logic": []}
+          # Ekstraksi cerdas: hanya ambil file yang kemungkinan besar berisi API
           for root, _, files in os.walk(source_dir):
               for file in files:
                   if file.endswith(('.java', '.kt')):
-                      path = os.path.join(root, file)
-                      try:
-                          with open(path, 'r', encoding='utf-8') as f:
-                              content = f.read()
-                              # Cari pola API Tribun secara spesifik
-                              if any(k in content for k in ['tribun', 'api', 'retrofit', 'endpoint']):
-                                  context["api_logic"].append({"file": file, "snippet": content[:8000]})
-                      except: continue
+                      if any(k in file.lower() for k in ['api', 'service', 'network', 'client', 'repository']):
+                          path = os.path.join(root, file)
+                          try:
+                              with open(path, 'r', encoding='utf-8') as f:
+                                  content = f.read()
+                                  if 'tribun' in content.lower():
+                                      context["api_logic"].append({"file": file, "snippet": content[:8000]})
+                          except: continue
           with open('ai_input.json', 'w') as f:
               json.dump(context, f, indent=2)
           EOF
 
-      - name: Setup Bun & AI Runner
+      - name: AI Runner - Deep Audit
         uses: oven-sh/setup-bun@v1
         with:
           bun-version: latest
 
-      - name: AI Audit & Generate Postman
+      - name: AI Audit & Postman Generate
         run: |
           bun install -g opencode-ai
           python3 -c "
           ctx = open('ai_input.json').read()
-          prompt = f'Analisis endpoint API dari kode Tribunnews ini. Berikan output Postman Collection V2.1 dalam JSON murni:\n{ctx[:30000]}'
+          prompt = f'Kamu adalah Senior Security Auditor. Analisis kode Tribunnews ini. Cari Base URL dan Endpoint. Buat Postman Collection V2.1 JSON Murni:\n{ctx[:35000]}'
           open('prompt.txt', 'w').write(prompt)
           "
           opencode run "$(cat prompt.txt)" > raw_output.json
@@ -121,9 +137,9 @@ jobs:
               match = re.search(r'(\{.*\})', content, re.DOTALL)
               if match:
                   data = json.loads(match.group(1))
-                  with open('Tribun_Audit_Report.json', 'w') as f:
+                  with open('Tribun_API_Audit.json', 'w') as f:
                       json.dump(data, f, indent=4)
-                  print("✅ Berhasil! File Postman siap.")
+                  print("✅ Selesai!")
               else: sys.exit(1)
           except: sys.exit(1)
           EOF
@@ -132,7 +148,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: api-audit-tribun
-          path: |
-            Tribun_Audit_Report.json
-            error_debug.png
+          name: audit-results-tribun
+          path: Tribun_API_Audit.json
