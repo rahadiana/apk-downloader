@@ -1,4 +1,4 @@
-name: Agentic APK Auditor - Deep Analysis
+name: Agentic APK Auditor - Stable Version
 
 on:
   push:
@@ -13,12 +13,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      ## 1. SETUP TOOLS
+      ## 1. SETUP (JADX & Tools)
       - name: Install Forensic Tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y wget unzip python3 jq curl grep
-          # JADX Decompiler
           wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
@@ -26,14 +25,13 @@ jobs:
       ## 2. FETCH APK
       - name: Fetch Target APK
         run: |
-          # Ganti URL ini dengan APK yang ingin di-audit
+          # Menggunakan link yang kamu berikan sebelumnya sebagai testing
           curl -L -o target.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk"
           if [ ! -s target.apk ]; then echo "❌ Download gagal!"; exit 1; fi
 
-      ## 3. DECOMPILE (HANYA SOURCE CODE)
+      ## 3. DECOMPILE (DEX Only for speed)
       - name: Decompile APK
         run: |
-          echo ">>> Membongkar APK..."
           jadx target.apk -d extracted_source --no-res --show-bad-code --threads-count 4
 
       ## 4. SETUP BUN & OPENCODE AI
@@ -42,64 +40,75 @@ jobs:
         with:
           bun-version: latest
 
-      ## 5. AGENTIC AI ANALYSIS (THE CORE)
+      ## 5. AGENTIC AI ANALYSIS (REFINED)
       - name: Agentic Deep Audit
         run: |
           bun install -g opencode-ai
           
-          # Kita buat instruksi Agentic yang kuat.
-          # AI diberikan izin menggunakan shell untuk navigasi folder.
+          # Kita buat instruksi yang lebih 'to-the-point'
+          # Kita minta AI menggunakan 'grep' secara eksplisit di awal
           
           cat << 'EOF' > agent_instruction.txt
-          Kamu adalah Agentic API Security Researcher. 
-          Tugasmu adalah mengaudit folder 'extracted_source/sources' untuk menemukan semua endpoint API.
+          Konteks: Kamu adalah Agentic AI yang memiliki akses shell ke folder 'extracted_source/sources'.
           
-          KEMAMPUANMU:
-          1. Kamu bisa menggunakan perintah shell (grep, find, cat, ls) untuk menjelajah kode.
-          2. Jangan hanya mencari keyword, tapi telusuri relasi antar file jika menemukan variabel Base URL.
+          Tujuan: Temukan semua API Endpoints dan buat Postman Collection V2.1.
           
-          STRATEGI:
-          - Cari file Interface (Retrofit) atau Class Networking (OkHttp).
-          - Identifikasi Base URL (Production/Staging).
-          - Ekstrak Path, Method (GET/POST/PUT), Headers, dan skema Autentikasi.
+          Langkah Wajib:
+          1. Jalankan `grep -rE "@GET|@POST|BASE_URL|http" .` untuk memetakan file penting.
+          2. Baca file yang paling relevan dengan `cat [nama_file]`.
+          3. Analisis header (seperti Authorization atau API Keys).
           
-          OUTPUT:
-          - Berikan hasil akhir dalam format JSON Postman Collection V2.1.
-          - Simpan hasil tersebut ke dalam file bernama 'Final_Audit_Postman.json'.
-          - Jika sudah selesai, katakan "AUDIT_COMPLETE".
+          Output:
+          HANYA hasilkan JSON Postman Collection. Jangan ada penjelasan.
+          Jika sudah, simpan ke 'Final_Audit_Postman.json'.
           EOF
 
-          # Menjalankan OpenCode dengan akses ke filesystem hasil dekompilasi
-          opencode run "$(cat agent_instruction.txt)" --allow-shell --path ./extracted_source/sources > raw_agent_output.txt
+          # Gunakan flag --allow-shell dengan proteksi path
+          opencode run "$(cat agent_instruction.txt)" --allow-shell --path ./extracted_source > agent_log.txt
 
-      ## 6. VALIDASI & CLEANUP
+      ## 6. ROBUST EXTRACTION (ANTI-ERROR)
       - name: Finalize Result
         run: |
           python3 - << 'EOF'
           import re, json, os, sys
           
-          output_file = 'Final_Audit_Postman.json'
-          raw_log = 'raw_agent_output.txt'
+          def find_json(text):
+              # Mencari pola JSON di dalam log agent
+              matches = re.findall(r'(\{.*\})', text, re.DOTALL)
+              if matches:
+                  # Ambil yang paling panjang (biasanya itu Postman Collection-nya)
+                  return max(matches, key=len)
+              return None
+
+          log_path = 'agent_log.txt'
+          output_path = 'Final_Audit_Postman.json'
+
+          if os.path.exists(log_path):
+              with open(log_path, 'r', encoding='utf-8') as f:
+                  content = f.read()
+              
+              json_data = find_json(content)
+              if json_data:
+                  try:
+                      # Validasi sebelum tulis
+                      parsed = json.loads(json_data)
+                      with open(output_path, 'w') as f:
+                          json.dump(parsed, f, indent=4)
+                      print("✅ JSON Berhasil diekstrak dan divalidasi.")
+                      sys.exit(0)
+                  except:
+                      print("⚠️ JSON ditemukan tapi malformed.")
           
-          if not os.path.exists(output_file):
-              # Jika AI tidak membuat file sendiri, kita coba ekstrak dari log output-nya
-              print(">>> Mencoba mengekstrak JSON dari log agent...")
-              if os.path.exists(raw_log):
-                  with open(raw_log, 'r') as f:
-                      content = f.read()
-                  match = re.search(r'(\{.*\})', content, re.DOTALL)
-                  if match:
-                      with open(output_file, 'w') as f:
-                          f.write(match.group(1))
-                      print("✅ Berhasil mengekstrak JSON.")
-                  else:
-                      print("❌ Gagal menemukan JSON di log.")
-                      sys.exit(1)
-          else:
-              print("✅ File JSON ditemukan (dibuat langsung oleh agent).")
+          # Jika file sudah dibuat langsung oleh agent (seperti perintah di prompt)
+          if os.path.exists(output_path):
+              print("✅ File sudah dibuat langsung oleh agent.")
+              sys.exit(0)
+          
+          print("❌ Gagal menemukan hasil audit.")
+          sys.exit(1)
           EOF
 
-      ## 7. UPLOAD ARTIFACTS
+      ## 7. UPLOAD
       - name: Upload Audit Results
         if: always()
         uses: actions/upload-artifact@v4
@@ -107,4 +116,4 @@ jobs:
           name: agentic-audit-results
           path: |
             Final_Audit_Postman.json
-            raw_agent_output.txt
+            agent_log.txt
