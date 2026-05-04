@@ -1,4 +1,4 @@
-name: Agentic APK Auditor - Universal
+name: Agentic APK Auditor - Ultra Deep
 
 on:
   push:
@@ -13,7 +13,7 @@ on:
 jobs:
   agentic-audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 460
 
     steps:
       - name: Checkout Repository
@@ -33,124 +33,220 @@ jobs:
           echo "Downloading: $APK_URL"
           curl -L -o target.apk "$APK_URL"
           if [ ! -s target.apk ]; then echo "Download gagal!"; exit 1; fi
-          echo "Download OK: $(ls -lh target.apk | awk '{print $5}')"
+          echo "OK: $(ls -lh target.apk | awk '{print $5}')"
 
       - name: Decompile APK
         run: |
           jadx target.apk -d extracted_source --no-res --show-bad-code --threads-count 4
-          echo "Total files: $(find extracted_source -name '*.java' | wc -l) java files"
+          echo "Total: $(find extracted_source -name '*.java' | wc -l) java files"
 
-      - name: Build AI Context (Universal Deep Extraction)
+      - name: Build AI Context
         run: |
           python3 << 'PYEOF'
           import os, json, re
 
           source_dir = 'extracted_source'
 
-          # -------------------------------------------------------
-          # UNIVERSAL KEYWORDS — berlaku untuk semua APK
-          # Deteksi otomatis pattern Retrofit, OkHttp, Volley,
-          # Apollo (GraphQL), gRPC, raw URL string, dll
-          # -------------------------------------------------------
           NETWORK_KEYWORDS = [
-              # Retrofit annotations
               '@GET', '@POST', '@PUT', '@DELETE', '@PATCH', '@HEAD', '@OPTIONS',
               '@Query', '@Path', '@Body', '@Header', '@Headers', '@Field',
               '@FormUrlEncoded', '@Multipart', '@Part', '@Url',
-              'retrofit2', 'Retrofit.Builder', 'baseUrl',
-              # OkHttp
+              'retrofit2', 'Retrofit.Builder', 'baseUrl', 'BASE_URL',
               'OkHttpClient', 'Request.Builder', 'HttpUrl',
-              # Volley
               'RequestQueue', 'StringRequest', 'JsonObjectRequest',
-              # Apollo / GraphQL
-              'ApolloClient', 'graphql', 'mutation', 'query {',
-              # Generic URL patterns
+              'ApolloClient', 'graphql',
               'http://', 'https://',
               '/api/', '/v1/', '/v2/', '/v3/',
-              # Auth
-              'Authorization', 'Bearer', 'X-Api-Key', 'api_key', 'token',
-              # Common class names
+              'Authorization', 'Bearer', 'X-Api-Key', 'api_key',
               'ApiService', 'ApiClient', 'NetworkService', 'RemoteDataSource',
-              'RestClient', 'EndpointService',
+              'RestClient', 'EndpointService', 'DataSource', 'Repository',
           ]
 
-          EXCLUDE_PATTERNS = [
-              'google', 'firebase', 'facebook', 'twitter', 'android.com',
-              'schema.org', 'w3.org', 'apache.org', 'junit', 'test',
-              'BuildConfig', 'R.string', '.png', '.jpg', '.svg', '.xml',
+          SKIP_KEYWORDS = [
+              'junit', 'androidx.test', 'BuildConfig', 'R.string',
           ]
 
-          results = {
-              "base_urls": [],
-              "api_files": [],
-              "total_files_scanned": 0
-          }
-
+          results = {"base_urls": [], "api_files": [], "total_files_scanned": 0}
           seen_urls = set()
 
           for root, _, files in os.walk(source_dir):
               for file in files:
                   if not file.endswith(('.java', '.kt')):
                       continue
-
                   path = os.path.join(root, file)
                   results["total_files_scanned"] += 1
-
                   try:
                       with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                           content = f.read()
                   except:
                       continue
-
-                  # Skip file yang tidak relevan
-                  content_lower = content.lower()
-                  if any(ex.lower() in content_lower for ex in EXCLUDE_PATTERNS):
-                      # Tetap proses jika ada annotation Retrofit
-                      has_retrofit = any(k in content for k in ['@GET', '@POST', '@PUT', '@DELETE', 'retrofit2', 'OkHttp'])
-                      if not has_retrofit:
-                          continue
-
-                  # Cek apakah file ini relevan
-                  matched_keywords = [k for k in NETWORK_KEYWORDS if k in content]
-                  if not matched_keywords:
+                  if any(k in content for k in SKIP_KEYWORDS):
                       continue
-
-                  # Ekstrak base URL dari file ini
-                  url_matches = re.findall(r'https?://[^\s\'"<>{}\\]+', content)
-                  for url in url_matches:
-                      # Ambil base URL saja (sampai path pertama)
+                  matched = [k for k in NETWORK_KEYWORDS if k in content]
+                  if not matched:
+                      continue
+                  for url in re.findall(r'https?://[^\s\'"<>{}\\]+', content):
                       base = re.match(r'(https?://[^/\s]+(?:/[^/\s]+)?)', url)
                       if base:
                           clean = base.group(1).rstrip('.,;)')
                           if clean not in seen_urls and len(clean) > 10:
                               seen_urls.add(clean)
                               results["base_urls"].append(clean)
-
-                  # Simpan file dengan konteks penuh
                   results["api_files"].append({
                       "file": os.path.relpath(path, source_dir),
-                      "matched_keywords": matched_keywords[:10],
-                      "content": content[:10000]  # 10rb karakter per file
+                      "score": len(matched),
+                      "matched_keywords": matched[:15],
+                      "content": content[:12000]
                   })
 
-          # Sort: file dengan paling banyak keyword duluan
-          results["api_files"].sort(key=lambda x: len(x["matched_keywords"]), reverse=True)
+          results["api_files"].sort(key=lambda x: x["score"], reverse=True)
+          results["api_files"] = results["api_files"][:25]
 
-          # Ambil top 20 file paling relevan
-          results["api_files"] = results["api_files"][:20]
-
-          print(f"Total files scanned: {results['total_files_scanned']}")
-          print(f"Relevant API files found: {len(results['api_files'])}")
-          print(f"Base URLs found: {len(results['base_urls'])}")
-          print("Top files:")
-          for f in results["api_files"][:5]:
-              print(f"  - {f['file']} [{', '.join(f['matched_keywords'][:3])}]")
+          print(f"Scanned: {results['total_files_scanned']} files")
+          print(f"Relevant: {len(results['api_files'])} files")
+          print(f"Base URLs: {results['base_urls'][:5]}")
 
           with open('ai_input.json', 'w') as f:
               json.dump(results, f, indent=2)
-
-          print("ai_input.json written.")
           PYEOF
+
+      ## Setup opencode config SEBELUM run — ini yang bikin ultra deep
+      - name: Setup OpenCode Config & Agent
+        run: |
+          mkdir -p .opencode/agents .opencode/skills/apk-analyst
+
+          # 1. opencode.json — config global: model terbaik, temperature rendah untuk presisi
+          cat > opencode.json << 'JSON'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "agent": {
+              "apk-auditor": {
+                "description": "Elite Android APK reverse engineer specialized in extracting API endpoints and creating Postman collections",
+                "mode": "primary",
+                "temperature": 0.1,
+                "steps": 50,
+                "permission": {
+                  "read": "allow",
+                  "edit": "allow",
+                  "bash": "allow",
+                  "glob": "allow",
+                  "grep": "allow",
+                  "list": "allow"
+                }
+              }
+            }
+          }
+          JSON
+
+          # 2. AGENTS.md — rules permanen yang selalu dibaca opencode
+          cat > AGENTS.md << 'MD'
+          # APK Reverse Engineering Agent
+
+          You are an Elite Android APK Security Researcher and API Reverse Engineer.
+
+          ## Your Mission
+          Analyze decompiled Android APK source code and extract ALL API endpoints into a Postman Collection V2.1 JSON file.
+
+          ## Project Structure
+          - `extracted_source/` — decompiled Java/Kotlin source from JADX
+          - `ai_input.json` — pre-extracted list of relevant API files and base URLs
+          - `Final_Audit_Postman.json` — YOUR OUTPUT FILE (must be created)
+
+          ## Mandatory Workflow
+          1. Read `ai_input.json` first to get the list of relevant files and base URLs
+          2. Read EACH file listed in `ai_input.json` using your read tool — do NOT skip files
+          3. For each file, extract:
+             - HTTP method (@GET, @POST, @PUT, @DELETE, @PATCH)
+             - Endpoint path (including path variables like {id})
+             - Query parameters (@Query)
+             - Request body structure (@Body)
+             - Headers (@Header, @Headers)
+             - Base URL / BASE_URL constant
+          4. Also use grep/glob to search for MORE files not in the list:
+             - grep for "BASE_URL" across all files
+             - grep for "interface.*Api" or "interface.*Service"
+             - Find any string containing "/api/" or "/v1/" or "/v2/"
+          5. Reconstruct full URLs: base_url + path
+          6. Write Final_Audit_Postman.json with ALL found endpoints
+
+          ## Output Format
+          Postman Collection V2.1 — must have "info" and "item" keys.
+          Group endpoints by feature module (Auth, User, Search, etc).
+          Include example request bodies and headers where found.
+
+          ## Critical Rules
+          - NEVER invent or guess endpoints — only include what is in the code
+          - ALWAYS read the actual source files, not just the summary
+          - If a file has Retrofit annotations, read it completely
+          - Check for multiple base URLs (staging, production, etc)
+          MD
+
+          # 3. Agent skill khusus APK analysis
+          cat > .opencode/skills/apk-analyst/SKILL.md << 'SKILL'
+          ---
+          name: apk-analyst
+          description: Specialized skill for Android APK reverse engineering, Retrofit API extraction, and Postman collection generation
+          license: MIT
+          compatibility: opencode
+          ---
+
+          ## APK Analysis Patterns
+
+          ### Finding Retrofit Interfaces
+          ```bash
+          grep -rn "@GET\|@POST\|@PUT\|@DELETE\|@PATCH" extracted_source/ --include="*.java" -l
+          grep -rn "interface.*Service\|interface.*Api\|interface.*Endpoint" extracted_source/ --include="*.java" -l
+          ```
+
+          ### Finding Base URLs
+          ```bash
+          grep -rn "BASE_URL\|baseUrl\|base_url\|BuildConfig.API" extracted_source/ --include="*.java"
+          grep -rn '"https://\|"http://' extracted_source/ --include="*.java" | grep -v "test\|Test"
+          ```
+
+          ### Finding Auth Headers
+          ```bash
+          grep -rn "Authorization\|Bearer\|X-Api-Key\|X-Auth\|token" extracted_source/ --include="*.java" | head -50
+          ```
+
+          ### Finding OkHttp Interceptors (often contains auth logic)
+          ```bash
+          grep -rn "Interceptor\|addHeader\|header(" extracted_source/ --include="*.java" -l
+          ```
+
+          ### Postman Collection V2.1 Template
+          ```json
+          {
+            "info": {
+              "name": "APK API Collection",
+              "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+            },
+            "item": [
+              {
+                "name": "Feature Group",
+                "item": [
+                  {
+                    "name": "Endpoint Name",
+                    "request": {
+                      "method": "GET",
+                      "header": [],
+                      "url": {
+                        "raw": "{{base_url}}/api/v1/example",
+                        "host": ["{{base_url}}"],
+                        "path": ["api", "v1", "example"]
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+          ```
+          SKILL
+
+          echo "Config setup done."
+          ls -la opencode.json AGENTS.md
+          ls -la .opencode/agents/ .opencode/skills/apk-analyst/
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v1
@@ -161,54 +257,12 @@ jobs:
         run: |
           bun install -g opencode-ai
 
-          # Buat prompt file pakai python — aman dari escaping issue
-          python3 -c "
-          import json
-
-          with open('ai_input.json', 'r') as f:
-              ctx = json.load(f)
-
-          base_urls = '\n'.join(ctx.get('base_urls', []))
-          file_count = len(ctx.get('api_files', []))
-
-          # Ringkas context: file name + keywords + content
-          files_summary = ''
-          for item in ctx.get('api_files', []):
-              files_summary += f\"\n\n=== FILE: {item['file']} ===\n\"
-              files_summary += f\"Keywords: {', '.join(item['matched_keywords'])}\n\"
-              files_summary += item['content'][:8000]
-
-          prompt = f'''You are an Elite API Security Researcher and Android reverse engineer.
-
-          I have decompiled an Android APK and extracted {file_count} relevant source files containing networking logic.
-
-          BASE URLS FOUND IN APK:
-          {base_urls}
-
-          YOUR TASK:
-          1. Analyze ALL the source files below carefully
-          2. Find EVERY real API endpoint (GET, POST, PUT, DELETE, etc)
-          3. Extract: base URL, path, HTTP method, query params, path params, request body, headers, auth tokens
-          4. Write a COMPLETE Postman Collection V2.1 JSON to a file named: Final_Audit_Postman.json
-          5. The JSON MUST have info and item keys
-          6. Only include endpoints that are actually found in the code — do NOT invent or guess
-          7. Group endpoints by feature/module
-
-          SOURCE FILES:
-          {files_summary[:40000]}
-          '''
-
-          with open('prompt.txt', 'w') as f:
-              f.write(prompt)
-
-          print(f'Prompt written: {len(prompt)} chars')
-          "
-
-          echo "Running opencode..."
+          # Jalankan dengan agent khusus apk-auditor
+          # AI akan baca AGENTS.md + skills otomatis — tidak perlu prompt panjang
           opencode run \
-            -f ai_input.json \
+            --agent apk-auditor \
             --dangerously-skip-permissions \
-            "$(cat prompt.txt)" \
+            "Start the APK audit. Read ai_input.json, analyze all source files, use the apk-analyst skill, then write Final_Audit_Postman.json with every API endpoint found." \
             2>&1 | tee agent_log.txt || true
 
           echo "=== FILES AFTER OPENCODE ==="
@@ -219,25 +273,26 @@ jobs:
         run: |
           python3 -c "
           import json, os, sys
-          output_path = 'Final_Audit_Postman.json'
-          if not os.path.exists(output_path):
-              print('Gagal: File Final_Audit_Postman.json tidak ditemukan.')
+          path = 'Final_Audit_Postman.json'
+          if not os.path.exists(path):
+              print('GAGAL: File tidak ditemukan.')
               sys.exit(1)
-          with open(output_path, 'r', encoding='utf-8') as f:
+          with open(path) as f:
               content = f.read().strip()
           if not content:
-              print('Gagal: File kosong.')
+              print('GAGAL: File kosong.')
               sys.exit(1)
           try:
               parsed = json.loads(content)
-          except json.JSONDecodeError as e:
-              print(f'JSON tidak valid: {e}')
+          except Exception as e:
+              print(f'GAGAL: JSON invalid — {e}')
               sys.exit(1)
           if 'info' not in parsed or 'item' not in parsed:
-              print(f'Bukan Postman Collection V2.1. Keys: {list(parsed.keys())}')
+              print(f'GAGAL: Bukan Postman V2.1. Keys: {list(parsed.keys())}')
               sys.exit(1)
-          endpoints = parsed.get('item', [])
-          print(f'Sukses: {len(endpoints)} endpoint(s) ditemukan.')
+          items = parsed.get('item', [])
+          total = sum(len(g.get('item', [1])) for g in items)
+          print(f'SUKSES: {len(items)} grup, ~{total} endpoint ditemukan.')
           "
 
       - name: Upload Results
@@ -249,4 +304,5 @@ jobs:
             Final_Audit_Postman.json
             agent_log.txt
             ai_input.json
-            prompt.txt
+            AGENTS.md
+            opencode.json
