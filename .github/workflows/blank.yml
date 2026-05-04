@@ -39,6 +39,7 @@ jobs:
         run: |
           mkdir -p audit_hints
           cd extracted_source/sources || exit 1
+          # Ambil 100 baris pertama saja agar prompt tidak terlalu panjang (menghindari error tanpa key)
           grep -rE "@GET|@POST|BASE_URL|http|https" . | head -n 100 > ../../audit_hints/api_hints.txt || true
           find . -maxdepth 5 -name "*Api*" -o -name "*Service*" > ../../audit_hints/file_map.txt || true
           cd ../..
@@ -48,25 +49,25 @@ jobs:
         uses: oven-sh/setup-bun@v1
         with:
           bun-version: latest
-## 6. AGENTIC AI ANALYSIS (NO-KEY MODE)
+
+      ## 6. AGENTIC AI ANALYSIS (NO-KEY MODE)
       - name: Agentic Deep Audit
         run: |
           bun install -g opencode-ai
           
           cat << 'EOF' > agent_instruction.txt
-          Analyze the code in 'extracted_source/sources'. 
-          Map all API endpoints found in files matching '*Api*' or '*Service*'.
-          Return ONLY a valid Postman Collection V2.1 JSON.
+          TASK: Create a Postman Collection V2.1 JSON based on the API endpoints found in 'extracted_source/sources'.
+          Return ONLY the JSON object. Do not include any notes or explanations.
           EOF
 
-          # Kita jalankan tanpa env OPENAI_API_KEY
-          # Pastikan flag --dangerously-skip-permissions tetap ada agar tidak macet
+          # Jalankan tanpa API KEY
+          # Tambahkan --pure jika tersedia untuk mengurangi noise log
           opencode run "$(cat agent_instruction.txt)" \
             --dangerously-skip-permissions \
             --format json \
             --path . > agent_log.txt 2>&1 || echo "AI Process Finished"
 
-      ## 7. FINAL EXTRACTION (LEBIH KUAT)
+      ## 7. FINAL EXTRACTION (PERBAIKAN STREAM PARSING)
       - name: Finalize Result
         run: |
           python3 - << 'EOF'
@@ -76,30 +77,52 @@ jobs:
           output_path = 'Final_Audit_Postman.json'
 
           if not os.path.exists(log_path):
+              print("❌ Log file missing")
               sys.exit(1)
 
           with open(log_path, 'r', encoding='utf-8') as f:
-              content = f.read()
+              lines = f.readlines()
 
-          # AI tanpa Key seringkali memberikan pesan error di awal, 
-          # kita cari JSON yang benar-benar valid saja
+          # Gabungkan hanya field 'content' dari log stream JSON opencode
+          full_ai_response = ""
+          for line in lines:
+              try:
+                  entry = json.loads(line)
+                  if isinstance(entry, dict) and 'content' in entry:
+                      full_ai_response += entry['content']
+              except:
+                  # Jika baris bukan JSON (misal log install), abaikan
+                  continue
+
+          if not full_ai_response:
+              # Fallback: jika --format json gagal, gunakan konten mentah
+              full_ai_response = "".join(lines)
+
+          # Cari blok JSON Postman ({ ... })
+          # Kita cari kurung kurawal terluar yang mengandung "info" dan "item"
           json_pattern = re.compile(r'(\{.*\})', re.DOTALL)
-          matches = json_pattern.findall(content)
+          matches = json_pattern.findall(full_ai_response)
           
-          for match in reversed(matches): # Ambil dari yang paling akhir
+          found_valid = False
+          for match in reversed(matches):
               try:
                   data = json.loads(match)
-                  if "info" in data and "item" in data: # Cek struktur Postman
+                  if isinstance(data, dict) and "info" in data and "item" in data:
                       with open(output_path, 'w') as f:
                           json.dump(data, f, indent=4)
-                      print("✅ Sukses mengekstrak Postman Collection.")
-                      sys.exit(0)
+                      print("✅ Sukses: Postman Collection berhasil dibuat.")
+                      found_valid = True
+                      break
               except:
                   continue
           
-          print("❌ Tidak ditemukan JSON Postman yang valid di log.")
-          sys.exit(1)
+          if not found_valid:
+              print("❌ Gagal: AI tidak memberikan JSON Postman yang utuh.")
+              print("Preview response AI:")
+              print(full_ai_response[:500] + "...")
+              sys.exit(1)
           EOF
+
       ## 8. UPLOAD
       - name: Upload Results
         if: always()
