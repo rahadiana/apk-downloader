@@ -27,7 +27,7 @@ jobs:
         run: |
           echo ">>> Mendownload APK Target..."
           # Ganti link di bawah ini dengan APK yang mau di-audit
-          curl -L -o target.apk "LINK_APK_KAMU_DISINI"
+          curl -L -o target.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk"
           if [ ! -s target.apk ]; then echo "❌ File kosong!"; exit 1; fi
 
       ## 3. DECOMPILE
