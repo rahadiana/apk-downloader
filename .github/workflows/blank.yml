@@ -1,4 +1,4 @@
-name: Pro AI APK Auditor - Deep Endpoint Extraction
+name: Pro AI APK Auditor - Deep Analysis
 
 on:
   push:
@@ -13,11 +13,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      ## 1. SETUP (Tetap sama)
+      ## 1. SETUP TOOLS
       - name: Install Forensic Tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y wget unzip python3 python3-pip jq curl
+          # Install JADX
           wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
@@ -25,31 +26,29 @@ jobs:
       ## 2. FETCH APK
       - name: Fetch Target APK
         run: |
-          curl -L -o target.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk" # <--- Ganti Ini
+          echo ">>> Mendownload APK..."
+          # GANTI URL DI BAWAH INI DENGAN LINK APK TARGET
+          curl -L -o target.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk"
+          if [ ! -s target.apk ]; then echo "❌ Download gagal!"; exit 1; fi
 
-      ## 3. DECOMPILE
+      ## 3. DECOMPILE (SUMBER KODE SAJA)
       - name: Decompile
         run: |
           jadx target.apk -d extracted_source --no-res --show-bad-code --threads-count 4
 
-      ## 4. PRO CONTEXT EXTRACTION (THE MAGIC)
+      ## 4. SMART CONTEXT EXTRACTION (ANTI-SAMPAH)
       - name: Smart Filter & Extraction
         run: |
           python3 - << 'EOF'
-          import os, json, re
+          import os, json
           
           source_dir = 'extracted_source/sources'
           context = {"target_app_logic": []}
           
-          # Daftar folder yang HARUS diabaikan (SDK Sampah)
-          blacklist = [
-              'com/google', 'com/facebook', 'androidx', 'com/android', 
-              'kotlin', 'okhttp3', 'retrofit2', 'com/google/android',
-              'com/google/firebase', 'com/instabug', 'com/adjust'
-          ]
+          # Folder yang diabaikan (Library pihak ketiga)
+          blacklist = ['com/google', 'com/facebook', 'androidx', 'com/android', 'kotlin', 'okhttp3', 'retrofit2']
 
           for root, _, files in os.walk(source_dir):
-              # Skip folder blacklist
               if any(b in root.replace('\\', '/') for b in blacklist):
                   continue
                   
@@ -59,21 +58,11 @@ jobs:
                       try:
                           with open(path, 'r', encoding='utf-8') as f:
                               lines = f.readlines()
-                              
-                              # Hanya ambil baris yang relevan (Endpoint/URL/Auth)
-                              relevant_lines = []
-                              is_interesting = False
-                              for line in lines:
-                                  line = line.strip()
-                                  if any(k in line for k in ['@GET', '@POST', '@PUT', '@DELETE', 'BASE_URL', 'http://', 'https://', 'X-API-KEY', 'Authorization']):
-                                      relevant_lines.append(line)
-                                      is_interesting = True
-                              
-                              if is_interesting:
-                                  # Ambil maksimal 100 baris relevan per file agar tidak overload
+                              relevant = [l.strip() for l in lines if any(k in l for k in ['@GET', '@POST', 'BASE_URL', 'https://', 'Authorization'])]
+                              if relevant:
                                   context["target_app_logic"].append({
                                       "file": os.path.relpath(path, source_dir),
-                                      "logic": "\n".join(relevant_lines[:100])
+                                      "logic": "\n".join(relevant[:50])
                                   })
                       except: continue
 
@@ -81,95 +70,67 @@ jobs:
               json.dump(context, f, indent=2)
           EOF
 
-    ## 5. SETUP BUN & AI RUNNER
+      ## 5. SETUP BUN & AI RUNNER
       - name: Setup Bun
         uses: oven-sh/setup-bun@v1
         with:
           bun-version: latest
 
-      - name: AI Audit & Postman Generation
+      - name: AI Audit
         run: |
-          # Install tool AI
           bun install -g opencode-ai
-          
-          # Generate prompt secara dinamis
           python3 -c "
           import json, os
-          if not os.path.exists('ai_input.json'):
-              print('❌ File ai_input.json tidak ditemukan!'); exit(1)
-              
-          ctx = open('ai_input.json').read()
-          prompt = (
-              'Konteks: Kamu adalah Senior Penetration Tester.\n'
-              'Analisis baris kode berikut yang diambil dari logika internal aplikasi.\n'
-              'Tugas:\n'
-              '1. Temukan Base URL yang unik untuk aplikasi ini.\n'
-              '2. List semua endpoint path beserta method (GET/POST) dan parameter.\n'
-              '3. Identifikasi header custom atau pola token auth.\n\n'
-              'Output harus 100% JSON Postman Collection V2.1. Tanpa teks pembuka/penutup.\n'
-              'Input Kode:\n' + ctx[:35000]
-          )
-          open('prompt.txt', 'w').write(prompt)
+          if os.path.exists('ai_input.json'):
+              ctx = open('ai_input.json').read()
+              prompt = 'Analisis kode ini. Temukan base URL dan semua endpoint API. Output HANYA JSON Postman Collection V2.1 murni tanpa teks lain:\n' + ctx[:30000]
+              open('prompt.txt', 'w').write(prompt)
           "
-          
-          # Jalankan AI dan simpan hasilnya
           opencode run "$(cat prompt.txt)" > raw_ai_output.json
-          
-## 6. CLEANUP & PARSING JSON
+
+      ## 6. CLEANUP & PARSING (FIXED SYNTAX)
       - name: Finalize Postman Collection
         run: |
           python3 - << 'EOF'
           import re, json, sys, os
 
           def extract_json(text):
-              # Prioritas 1: Cari di dalam markdown code block
-              match = re.search(r'
-              ```json\s+(.*?)\s+```', text, re.DOTALL)
-              if match:
-                  return match.group(1)
-              
-              # Prioritas 2: Cari bracket { pertama sampai } terakhir
-              start = text.find('{')
-              end = text.rfind('}')
-              if start != -1 and end != -1:
-                  return text[start:end+1]
+              # Mencari pola JSON yang valid di antara bracket
+              try:
+                  start = text.find('{')
+                  end = text.rfind('}')
+                  if start != -1 and end != -1:
+                      return text[start:end+1]
+              except:
+                  pass
               return None
 
-          try:
-              if not os.path.exists('raw_ai_output.json'):
-                  print("❌ Error: File raw_ai_output.json tidak ditemukan!")
-                  sys.exit(1)
+          if not os.path.exists('raw_ai_output.json'):
+              print("❌ File output AI tidak ada!"); sys.exit(1)
 
-              with open('raw_ai_output.json', 'r', encoding='utf-8') as f:
-                  content = f.read()
+          with open('raw_ai_output.json', 'r', encoding='utf-8') as f:
+              raw_content = f.read()
 
-              print(">>> Menyeleksi JSON dari output AI...")
-              json_str = extract_json(content)
-              
-              if not json_str:
-                  print("❌ Error: AI tidak memberikan format JSON yang bisa dikenali.")
-                  print("--- RAW OUTPUT AI (500 chars) ---")
-                  print(content[:500])
-                  sys.exit(1)
+          clean_json = extract_json(raw_content)
 
-              # Validasi JSON
-              data = json.loads(json_str)
-              
-              # Simpan hasil akhir
-              with open('Final_Audit_Postman.json', 'w') as f:
-                  json.dump(data, f, indent=4)
-              
-              print("✅ Berhasil! File Final_Audit_Postman.json telah dibuat.")
-
-          except json.JSONDecodeError as e:
-              print(f"❌ Error: JSON Malformed! {e}")
-              sys.exit(1)
-          except Exception as e:
-              print(f"❌ Error Tak Terduga: {e}")
-              sys.exit(1)
+          if clean_json:
+              try:
+                  data = json.loads(clean_json)
+                  with open('Final_Audit_Postman.json', 'w') as f:
+                      json.dump(data, f, indent=4)
+                  print("✅ Berhasil membuat Final_Audit_Postman.json")
+              except Exception as e:
+                  print(f"❌ JSON Load Error: {e}"); sys.exit(1)
+          else:
+              print("❌ Gagal mengekstrak JSON dari AI"); sys.exit(1)
           EOF
+
+      ## 7. UPLOAD RESULTS
       - name: Upload
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pro-audit-results
-          path: Final_Audit_Postman.json
+          name: api-audit-results
+          path: |
+            Final_Audit_Postman.json
+            ai_input.json
