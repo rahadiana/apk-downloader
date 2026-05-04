@@ -8,12 +8,12 @@ on:
       apk_url:
         description: 'URL APK yang ingin diaudit'
         required: true
-        default: 'https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk'
+        default: 'https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk'
 
 jobs:
   agentic-audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 460
+    timeout-minutes: 60
 
     steps:
       - name: Checkout Repository
@@ -62,9 +62,7 @@ jobs:
               'RestClient', 'EndpointService', 'DataSource', 'Repository',
           ]
 
-          SKIP_KEYWORDS = [
-              'junit', 'androidx.test', 'BuildConfig', 'R.string',
-          ]
+          SKIP_KEYWORDS = ['junit', 'androidx.test']
 
           results = {"base_urls": [], "api_files": [], "total_files_scanned": 0}
           seen_urls = set()
@@ -110,18 +108,16 @@ jobs:
               json.dump(results, f, indent=2)
           PYEOF
 
-      ## Setup opencode config SEBELUM run — ini yang bikin ultra deep
       - name: Setup OpenCode Config & Agent
         run: |
-          mkdir -p .opencode/agents .opencode/skills/apk-analyst
+          mkdir -p .opencode/skills/apk-analyst
 
-          # 1. opencode.json — config global: model terbaik, temperature rendah untuk presisi
           cat > opencode.json << 'JSON'
           {
             "$schema": "https://opencode.ai/config.json",
             "agent": {
               "apk-auditor": {
-                "description": "Elite Android APK reverse engineer specialized in extracting API endpoints and creating Postman collections",
+                "description": "Elite Android APK reverse engineer that extracts API endpoints",
                 "mode": "primary",
                 "temperature": 0.1,
                 "steps": 50,
@@ -138,115 +134,72 @@ jobs:
           }
           JSON
 
-          # 2. AGENTS.md — rules permanen yang selalu dibaca opencode
           cat > AGENTS.md << 'MD'
           # APK Reverse Engineering Agent
 
           You are an Elite Android APK Security Researcher and API Reverse Engineer.
 
           ## Your Mission
-          Analyze decompiled Android APK source code and extract ALL API endpoints into a Postman Collection V2.1 JSON file.
-
-          ## Project Structure
-          - `extracted_source/` — decompiled Java/Kotlin source from JADX
-          - `ai_input.json` — pre-extracted list of relevant API files and base URLs
-          - `Final_Audit_Postman.json` — YOUR OUTPUT FILE (must be created)
+          Analyze decompiled Android APK source code and extract ALL API endpoints into a Postman Collection V2.1 JSON file named `Final_Audit_Postman.json`.
 
           ## Mandatory Workflow
-          1. Read `ai_input.json` first to get the list of relevant files and base URLs
-          2. Read EACH file listed in `ai_input.json` using your read tool — do NOT skip files
-          3. For each file, extract:
-             - HTTP method (@GET, @POST, @PUT, @DELETE, @PATCH)
-             - Endpoint path (including path variables like {id})
-             - Query parameters (@Query)
-             - Request body structure (@Body)
-             - Headers (@Header, @Headers)
-             - Base URL / BASE_URL constant
-          4. Also use grep/glob to search for MORE files not in the list:
-             - grep for "BASE_URL" across all files
-             - grep for "interface.*Api" or "interface.*Service"
-             - Find any string containing "/api/" or "/v1/" or "/v2/"
-          5. Reconstruct full URLs: base_url + path
-          6. Write Final_Audit_Postman.json with ALL found endpoints
+          1. Read `ai_input.json` to get list of relevant files and base URLs
+          2. Read EACH source file listed using your read/bash tools — do NOT skip
+          3. Also run these grep commands to find MORE endpoints:
+             - `grep -rn "@GET\|@POST\|@PUT\|@DELETE\|@PATCH" extracted_source/ --include="*.java" -l`
+             - `grep -rn "BASE_URL\|baseUrl" extracted_source/ --include="*.java"`
+             - `grep -rn "interface.*Api\|interface.*Service" extracted_source/ --include="*.java" -l`
+          4. Read every file returned by grep above
+          5. Extract: HTTP method, path, query params, body, headers, base URL
+          6. Write `Final_Audit_Postman.json` — group endpoints by feature module
 
-          ## Output Format
-          Postman Collection V2.1 — must have "info" and "item" keys.
-          Group endpoints by feature module (Auth, User, Search, etc).
-          Include example request bodies and headers where found.
+          ## CRITICAL: After Writing the File
+          - Once you have written Final_Audit_Postman.json, STOP immediately
+          - Do NOT rewrite or modify the file again
+          - Do NOT delete the file
+          - The file must remain at: Final_Audit_Postman.json
 
-          ## Critical Rules
-          - NEVER invent or guess endpoints — only include what is in the code
-          - ALWAYS read the actual source files, not just the summary
-          - If a file has Retrofit annotations, read it completely
-          - Check for multiple base URLs (staging, production, etc)
+          ## Rules
+          - NEVER invent endpoints — only use what is in the code
+          - Check for multiple base URLs (staging vs production)
           MD
 
-          # 3. Agent skill khusus APK analysis
           cat > .opencode/skills/apk-analyst/SKILL.md << 'SKILL'
           ---
           name: apk-analyst
-          description: Specialized skill for Android APK reverse engineering, Retrofit API extraction, and Postman collection generation
-          license: MIT
+          description: Specialized skill for Android APK reverse engineering and Postman collection generation from Retrofit/OkHttp source code
           compatibility: opencode
           ---
 
-          ## APK Analysis Patterns
+          ## grep Commands for APK Analysis
 
-          ### Finding Retrofit Interfaces
+          ### Find all Retrofit endpoint files
           ```bash
           grep -rn "@GET\|@POST\|@PUT\|@DELETE\|@PATCH" extracted_source/ --include="*.java" -l
-          grep -rn "interface.*Service\|interface.*Api\|interface.*Endpoint" extracted_source/ --include="*.java" -l
           ```
 
-          ### Finding Base URLs
+          ### Find Base URLs
           ```bash
-          grep -rn "BASE_URL\|baseUrl\|base_url\|BuildConfig.API" extracted_source/ --include="*.java"
-          grep -rn '"https://\|"http://' extracted_source/ --include="*.java" | grep -v "test\|Test"
+          grep -rn "BASE_URL\|baseUrl\|base_url" extracted_source/ --include="*.java"
+          grep -rn '"https://' extracted_source/ --include="*.java"
           ```
 
-          ### Finding Auth Headers
+          ### Find Auth/Headers
           ```bash
-          grep -rn "Authorization\|Bearer\|X-Api-Key\|X-Auth\|token" extracted_source/ --include="*.java" | head -50
+          grep -rn "Authorization\|Bearer\|X-Api-Key" extracted_source/ --include="*.java" | head -30
           ```
 
-          ### Finding OkHttp Interceptors (often contains auth logic)
-          ```bash
-          grep -rn "Interceptor\|addHeader\|header(" extracted_source/ --include="*.java" -l
-          ```
-
-          ### Postman Collection V2.1 Template
+          ## Postman V2.1 Template
           ```json
           {
             "info": {
               "name": "APK API Collection",
               "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
             },
-            "item": [
-              {
-                "name": "Feature Group",
-                "item": [
-                  {
-                    "name": "Endpoint Name",
-                    "request": {
-                      "method": "GET",
-                      "header": [],
-                      "url": {
-                        "raw": "{{base_url}}/api/v1/example",
-                        "host": ["{{base_url}}"],
-                        "path": ["api", "v1", "example"]
-                      }
-                    }
-                  }
-                ]
-              }
-            ]
+            "item": []
           }
           ```
           SKILL
-
-          echo "Config setup done."
-          ls -la opencode.json AGENTS.md
-          ls -la .opencode/agents/ .opencode/skills/apk-analyst/
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v1
@@ -257,17 +210,34 @@ jobs:
         run: |
           bun install -g opencode-ai
 
-          # Jalankan dengan agent khusus apk-auditor
-          # AI akan baca AGENTS.md + skills otomatis — tidak perlu prompt panjang
+          # Catat working directory — penting untuk debug
+          WORKDIR=$(pwd)
+          echo "Working dir: $WORKDIR"
+
           opencode run \
             --agent apk-auditor \
             --dangerously-skip-permissions \
-            "Start the APK audit. Read ai_input.json, analyze all source files, use the apk-analyst skill, then write Final_Audit_Postman.json with every API endpoint found." \
+            "Read ai_input.json, analyze all source files in extracted_source/ using bash grep and file read tools. Find every API endpoint. Write Final_Audit_Postman.json with all endpoints in Postman Collection V2.1 format. Once done, stop — do not modify the file again." \
             2>&1 | tee agent_log.txt || true
 
-          echo "=== FILES AFTER OPENCODE ==="
-          ls -la
-          find . -name "*.json" -newer ai_input.json 2>/dev/null || true
+          echo "=== Scan semua JSON yang mungkin ditulis opencode ==="
+          # Opencode kadang nulis di cwd berbeda — cari semua kemungkinan
+          find / -name "Final_Audit_Postman.json" 2>/dev/null || true
+          find $HOME -name "*.json" -newer ai_input.json 2>/dev/null | head -20 || true
+          find $WORKDIR -name "*.json" -newer ai_input.json 2>/dev/null || true
+
+          echo "=== ls working dir ==="
+          ls -la $WORKDIR
+
+      - name: Rescue Output File
+        run: |
+          # Cari file di mana pun opencode meletakkannya dan copy ke workdir
+          FOUND=$(find / -name "Final_Audit_Postman.json" 2>/dev/null | head -1)
+          if [ -n "$FOUND" ] && [ "$FOUND" != "$(pwd)/Final_Audit_Postman.json" ]; then
+            echo "File ditemukan di: $FOUND — copy ke workdir"
+            cp "$FOUND" ./Final_Audit_Postman.json
+          fi
+          ls -la Final_Audit_Postman.json 2>/dev/null || echo "File masih tidak ditemukan"
 
       - name: Validate Result
         run: |
@@ -276,6 +246,9 @@ jobs:
           path = 'Final_Audit_Postman.json'
           if not os.path.exists(path):
               print('GAGAL: File tidak ditemukan.')
+              print('Files di direktori:')
+              for f in os.listdir('.'):
+                  print(f'  - {f}')
               sys.exit(1)
           with open(path) as f:
               content = f.read().strip()
