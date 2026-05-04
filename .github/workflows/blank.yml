@@ -81,17 +81,27 @@ jobs:
               json.dump(context, f, indent=2)
           EOF
 
-      ## 5. AI RUNNER (STRICT INSTRUCTION)
-      - name: AI Audit
+    ## 5. SETUP BUN & AI RUNNER
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: AI Audit & Postman Generation
         run: |
-          # Setup Bun dan runner di sini (seperti sebelumnya)
+          # Install tool AI
           bun install -g opencode-ai
+          
+          # Generate prompt secara dinamis
           python3 -c "
-          import json
+          import json, os
+          if not os.path.exists('ai_input.json'):
+              print('❌ File ai_input.json tidak ditemukan!'); exit(1)
+              
           ctx = open('ai_input.json').read()
           prompt = (
               'Konteks: Kamu adalah Senior Penetration Tester.\n'
-              'Analisis baris kode berikut yang diambil dari logika internal aplikasi (ignore SDK libraries).\n'
+              'Analisis baris kode berikut yang diambil dari logika internal aplikasi.\n'
               'Tugas:\n'
               '1. Temukan Base URL yang unik untuk aplikasi ini.\n'
               '2. List semua endpoint path beserta method (GET/POST) dan parameter.\n'
@@ -101,21 +111,9 @@ jobs:
           )
           open('prompt.txt', 'w').write(prompt)
           "
+          
+          # Jalankan AI dan simpan hasilnya
           opencode run "$(cat prompt.txt)" > raw_ai_output.json
-
-      ## 6. FINALIZING
-      - name: Save Result
-        run: |
-          python3 -c "
-          import re, json, sys
-          content = open('raw_ai_output.json').read()
-          match = re.search(r'(\{.*\})', content, re.DOTALL)
-          if match:
-              data = json.loads(match.group(1))
-              with open('Final_Audit_Postman.json', 'w') as f:
-                  json.dump(data, f, indent=4)
-          "
-      
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
