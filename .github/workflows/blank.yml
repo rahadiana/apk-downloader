@@ -51,8 +51,6 @@ jobs:
 
       ## 6. AGENTIC AI ANALYSIS (FIXED CLI)
       - name: Agentic Deep Audit
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           bun install -g opencode-ai
           
