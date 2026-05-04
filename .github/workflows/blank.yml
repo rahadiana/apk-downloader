@@ -94,53 +94,52 @@ jobs:
           open('prompt.txt', 'w').write(prompt)
           "
           opencode run "$(cat prompt.txt)" > raw_ai_output.json
-
-      ## 6. CLEANUP & PARSING JSON
-      ## 6. CLEANUP & PARSING JSON
+## 6. CLEANUP & PARSING JSON
       - name: Finalize Postman Collection
         run: |
           python3 - << 'EOF'
           import re, json, sys
 
           def extract_json(text):
-              # 1. Try to find content inside Markdown code blocks
-              code_block = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-              if code_block:
-                  return code_block.group(1)
+              # Strategy 1: Look for Markdown JSON blocks
+              match = re.search(r'```json\s+(.*?)\s+```', text, re.DOTALL)
+              if match:
+                  return match.group(1)
               
-              # 2. Fallback: Find the first '{' and the last '}'
+              # Strategy 2: Look for any content between the first { and last }
+              # This handles cases where the AI adds text before or after the JSON
               start = text.find('{')
               end = text.rfind('}')
               if start != -1 and end != -1:
                   return text[start:end+1]
+              
               return None
 
           try:
               with open('raw_ai_output.json', 'r', encoding='utf-8') as f:
-                  content = f.read()
-              
-              json_str = extract_json(content)
+                  raw_content = f.read()
+
+              json_str = extract_json(raw_content)
               if not json_str:
-                  print("❌ No JSON structure found in AI output.")
+                  print("❌ No JSON found in output.")
                   sys.exit(1)
 
-              # Validate and prettify
+              # Validate that it's actually valid JSON
               data = json.loads(json_str)
+              
               with open('Sofascore_API_Audit.postman_collection.json', 'w') as f:
                   json.dump(data, f, indent=4)
               
-              print("✅ Postman Collection successfully extracted and validated!")
-
+              print("✅ Postman Collection isolated and saved!")
           except json.JSONDecodeError as e:
-              print(f"❌ JSON Syntax Error: {e}")
-              # Print a snippet of the problematic area for debugging
-              print(f"Context: {json_str[max(0, e.pos-40):e.pos+40]}")
+              print(f"❌ JSON is malformed: {e}")
+              # Print the first 200 chars to see what went wrong
+              print(f"Snippet: {json_str[:200]}...") 
               sys.exit(1)
           except Exception as e:
-              print(f"❌ Unexpected Error: {e}")
+              print(f"❌ Error: {e}")
               sys.exit(1)
           EOF
-
       ## 7. ARTIFACTS (SIMPAN HASIL)
       - name: Upload Results
         if: always()
