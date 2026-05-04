@@ -39,7 +39,6 @@ jobs:
         run: |
           mkdir -p audit_hints
           cd extracted_source/sources || exit 1
-          # Ambil 100 baris pertama saja agar prompt tidak terlalu panjang (menghindari error tanpa key)
           grep -rE "@GET|@POST|BASE_URL|http|https" . | head -n 100 > ../../audit_hints/api_hints.txt || true
           find . -maxdepth 5 -name "*Api*" -o -name "*Service*" > ../../audit_hints/file_map.txt || true
           cd ../..
@@ -50,70 +49,70 @@ jobs:
         with:
           bun-version: latest
 
-## 6. AGENTIC AI ANALYSIS (FIXED ARGS)
+      ## 6. AGENTIC AI ANALYSIS
       - name: Agentic Deep Audit
         run: |
           bun install -g opencode-ai
-          
-          # Buat instruksi simpel
-          echo "Create a Postman Collection V2.1 JSON from extracted_source/sources. Return ONLY raw JSON." > agent_instruction.txt
 
-          # Gunakan flag -f untuk memasukkan file instruksi
-          # Tambahkan --dangerously-skip-permissions agar tidak stuck
-          opencode run \
-            --file agent_instruction.txt \
+          API_HINTS=$(cat audit_hints/api_hints.txt)
+          FILE_MAP=$(cat audit_hints/file_map.txt)
+
+          # Tulis prompt ke file — opencode akan baca via stdin pipe
+          cat > prompt.txt << PROMPT
+          You are an API reverse engineer. Analyze the following extracted Android APK source hints and create a valid Postman Collection V2.1 JSON file.
+
+          IMPORTANT: Write the final result ONLY as a raw JSON file saved to: Final_Audit_Postman.json
+          Do NOT output the JSON to stdout. Use file writing tools to save it directly.
+          The JSON must have "info" and "item" keys as per Postman Collection V2.1 spec.
+
+          === API HINTS ===
+          ${API_HINTS}
+
+          === FILE MAP ===
+          ${FILE_MAP}
+          PROMPT
+
+          # Jalankan opencode — dia akan tulis file Final_Audit_Postman.json sendiri
+          cat prompt.txt | opencode \
             --dangerously-skip-permissions \
-            --format json \
-            --path . > agent_log.txt 2>&1 || echo "AI finished"
+            > agent_log.txt 2>&1 || echo "opencode finished"
 
-      ## 7. FINAL EXTRACTION (SMART PARSER)
-      - name: Finalize Result
+          echo "=== AGENT LOG ==="
+          cat agent_log.txt
+
+      ## 7. VALIDASI OUTPUT
+      - name: Validate Result
         run: |
           python3 - << 'EOF'
-          import json, os, sys, re
+          import json, os, sys
 
-          log_path = 'agent_log.txt'
           output_path = 'Final_Audit_Postman.json'
 
-          if not os.path.exists(log_path):
+          if not os.path.exists(output_path):
+              print("❌ Gagal: File Final_Audit_Postman.json tidak ditemukan.")
+              print("opencode tidak berhasil menulis file output.")
               sys.exit(1)
 
-          with open(log_path, 'r', encoding='utf-8') as f:
-              log_data = f.read()
+          with open(output_path, 'r', encoding='utf-8') as f:
+              content = f.read().strip()
 
-          # 1. Coba ekstrak jika log formatnya JSON Stream
-          combined_content = ""
-          for line in log_data.splitlines():
-              try:
-                  item = json.loads(line)
-                  if 'content' in item:
-                      combined_content += item['content']
-              except:
-                  continue
-          
-          # 2. Jika stream kosong, pakai raw log (siapa tahu bukan stream)
-          search_target = combined_content if combined_content else log_data
+          if not content:
+              print("❌ Gagal: File Final_Audit_Postman.json kosong.")
+              sys.exit(1)
 
-          # 3. Cari blok JSON Postman
-          # Cari string yang mengandung "info" dan "item" di dalam kurung kurawal
-          match = re.search(r'(\{.*"info".*"item".*\})', search_target, re.DOTALL)
-          
-          if match:
-              try:
-                  json_str = match.group(1)
-                  # Validasi JSON
-                  parsed = json.loads(json_str)
-                  with open(output_path, 'w') as f:
-                      json.dump(parsed, f, indent=4)
-                  print("✅ Sukses: Postman JSON berhasil dibuat.")
-                  sys.exit(0)
-              except Exception as e:
-                  print(f"❌ JSON Malformed: {e}")
-          
-          print("❌ Gagal: AI tidak memberikan output JSON yang benar.")
-          print("Isi log terakhir:")
-          print(search_target[-500:])
-          sys.exit(1)
+          try:
+              parsed = json.loads(content)
+          except json.JSONDecodeError as e:
+              print(f"❌ Gagal: JSON tidak valid — {e}")
+              sys.exit(1)
+
+          if 'info' not in parsed or 'item' not in parsed:
+              print("❌ Gagal: JSON tidak memiliki key 'info' atau 'item' (bukan Postman Collection V2.1).")
+              print(f"Keys yang ada: {list(parsed.keys())}")
+              sys.exit(1)
+
+          print(f"✅ Sukses: Postman Collection valid dengan {len(parsed.get('item', []))} endpoint(s).")
+          sys.exit(0)
           EOF
 
       ## 8. UPLOAD
@@ -126,3 +125,4 @@ jobs:
             Final_Audit_Postman.json
             agent_log.txt
             audit_hints/
+            prompt.txt
