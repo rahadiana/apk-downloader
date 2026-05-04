@@ -48,31 +48,13 @@ jobs:
         run: |
           bun install -g opencode-ai
 
-          API_HINTS=$(cat audit_hints/api_hints.txt)
-          FILE_MAP=$(cat audit_hints/file_map.txt)
-
-          # Tulis prompt ke file pakai printf — hindari heredoc agar tidak konflik YAML
-          printf '%s\n' \
-            "You are an API reverse engineer. Analyze the extracted Android APK source hints below." \
-            "Create a valid Postman Collection V2.1 JSON file." \
-            "" \
-            "CRITICAL INSTRUCTIONS:" \
-            "- Write the result to a file named exactly: Final_Audit_Postman.json" \
-            "- The JSON must have info and item keys (Postman Collection V2.1 format)" \
-            "- Do NOT print JSON to terminal, write it to the file using your file writing tools" \
-            "" \
-            "=== API HINTS ===" \
-            "$API_HINTS" \
-            "" \
-            "=== FILE MAP ===" \
-            "$FILE_MAP" \
-            > prompt.txt
-
-          PROMPT_TEXT=$(cat prompt.txt)
-
+          # Pakai -f untuk attach file hints langsung ke opencode
+          # Message sebagai positional argument — tidak perlu --prompt
           opencode run \
-            --prompt "$PROMPT_TEXT" \
+            -f audit_hints/api_hints.txt \
+            -f audit_hints/file_map.txt \
             --dangerously-skip-permissions \
+            "You are an API reverse engineer. Analyze the attached APK source hints. Create a valid Postman Collection V2.1 JSON and write it to a file named Final_Audit_Postman.json using your file writing tools. The JSON must have info and item keys." \
             2>&1 | tee agent_log.txt || true
 
           echo "=== FILES SETELAH OPENCODE ==="
@@ -83,30 +65,23 @@ jobs:
         run: |
           python3 -c "
           import json, os, sys
-
           output_path = 'Final_Audit_Postman.json'
-
           if not os.path.exists(output_path):
               print('Gagal: File Final_Audit_Postman.json tidak ditemukan.')
               sys.exit(1)
-
           with open(output_path, 'r', encoding='utf-8') as f:
               content = f.read().strip()
-
           if not content:
               print('Gagal: File kosong.')
               sys.exit(1)
-
           try:
               parsed = json.loads(content)
           except json.JSONDecodeError as e:
               print(f'JSON tidak valid: {e}')
               sys.exit(1)
-
           if 'info' not in parsed or 'item' not in parsed:
               print(f'Bukan Postman Collection V2.1. Keys: {list(parsed.keys())}')
               sys.exit(1)
-
           print(f'Sukses: {len(parsed.get(\"item\", []))} endpoint(s) ditemukan.')
           "
 
@@ -119,4 +94,3 @@ jobs:
             Final_Audit_Postman.json
             agent_log.txt
             audit_hints/
-            prompt.txt
