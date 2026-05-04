@@ -14,12 +14,11 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      ## 1. SETUP TOOLS (JADX & PYTHON)
+      ## 1. SETUP TOOLS
       - name: Install Forensic Tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y wget unzip python3 jq curl grep
-          # Install JADX
           wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
@@ -27,118 +26,104 @@ jobs:
       ## 2. FETCH APK
       - name: Fetch Target APK
         run: |
-          # Mengambil APK dari source yang kamu berikan
           curl -L -o target.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk"
-          if [ ! -s target.apk ]; then 
-            echo "❌ File APK kosong atau download gagal!"; 
-            exit 1; 
-          fi
+          if [ ! -s target.apk ]; then echo "❌ Download gagal!"; exit 1; fi
 
-      ## 3. DECOMPILE (DEX TO JAVA)
+      ## 3. DECOMPILE
       - name: Decompile APK
         run: |
-          # --no-res agar lebih cepat (fokus ke kode saja)
           jadx target.apk -d extracted_source --no-res --show-bad-code --threads-count 4
 
-      ## 4. PRE-AUDIT (Mapping API untuk AI)
+      ## 4. PRE-AUDIT MAPPING
       - name: Map API Structure
         run: |
-          echo ">>> Mencari petunjuk API secara manual..."
           mkdir -p audit_hints
           cd extracted_source/sources || exit 1
-          # Mencari keyword sensitif dan endpoint
-          grep -rE "@GET|@POST|BASE_URL|http|https|apiKey|api_key" . > ../../audit_hints/api_hints.txt || true
-          find . -maxdepth 5 -name "*Api*" -o -name "*Service*" -o -name "*Client*" > ../../audit_hints/file_map.txt || true
+          grep -rE "@GET|@POST|BASE_URL|http|https" . | head -n 100 > ../../audit_hints/api_hints.txt || true
+          find . -maxdepth 5 -name "*Api*" -o -name "*Service*" > ../../audit_hints/file_map.txt || true
           cd ../..
 
-      ## 5. SETUP BUN & OPENCODE AI
+      ## 5. SETUP BUN
       - name: Setup Bun
         uses: oven-sh/setup-bun@v1
         with:
           bun-version: latest
 
-      ## 6. AGENTIC AI ANALYSIS
+      ## 6. AGENTIC AI ANALYSIS (FIXED CLI)
       - name: Agentic Deep Audit
         env:
-          # Pastikan kamu sudah memasukkan secret OPENAI_API_KEY atau ANTHROPIC_API_KEY di GitHub
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }} 
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           bun install -g opencode-ai
           
           cat << 'EOF' > agent_instruction.txt
-          SYSTEM: You are an Elite API Security Auditor.
-          
-          CONTEXT:
-          I have decompiled an APK. 
-          - 'audit_hints/api_hints.txt' has networking code snippets.
-          - 'audit_hints/file_map.txt' shows the file structure.
-          
-          TASK:
-          1. Analyze the snippets and file paths.
-          2. Identify API Endpoints, Headers, and Parameters.
-          3. Generate a VALID Postman Collection V2.1 JSON.
-          
-          OUTPUT CONSTRAINT:
-          Return ONLY the JSON. Place the JSON inside a markdown code block like this:
-          ```json
-          { "info": { ... }, "item": [ ... ] }
-          ```
+          TASK: Analyze 'audit_hints/api_hints.txt' and 'audit_hints/file_map.txt'.
+          Generate a Postman Collection V2.1 JSON for the discovered API endpoints.
+          Return ONLY the raw JSON object. No conversation.
           EOF
 
-          # Jalankan AI dan simpan log
-          opencode run "$(cat agent_instruction.txt)" --allow-shell --path . > agent_log.txt 2>&1 || echo "AI completed with warnings"
+          # MENGGUNAKAN FLAG DOKUMENTASI:
+          # --dangerously-skip-permissions: Agar tidak stuck minta izin baca file
+          # --format json: Agar output log berupa stream JSON
+          opencode run "$(cat agent_instruction.txt)" \
+            --dangerously-skip-permissions \
+            --format json \
+            --path . > agent_log.txt 2>&1 || echo "AI process finished"
 
       ## 7. FINAL EXTRACTION (PYTHON PARSER)
       - name: Finalize Result
         run: |
           python3 - << 'EOF'
-          import re, json, os, sys
+          import json, os, sys, re
 
           log_path = 'agent_log.txt'
           output_path = 'Final_Audit_Postman.json'
 
           if not os.path.exists(log_path):
-              print("❌ Log file tidak ditemukan.")
+              print("❌ Log file missing")
               sys.exit(1)
 
           with open(log_path, 'r', encoding='utf-8') as f:
-              content = f.read()
+              raw_content = f.read()
 
-          # Strategi 1: Cari di dalam blok ```json ... ```
-          json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
-          
-          json_str = None
-          if json_match:
-              json_str = json_match.group(1)
-          else:
-              # Strategi 2: Cari kurung kurawal terluar jika tidak ada markdown
-              json_match = re.search(r'(\{.*\})', content, re.DOTALL)
-              if json_match:
-                  json_str = json_match.group(1)
-
-          if json_str:
+          # Mencoba mencari JSON di dalam stream output
+          # Karena pakai --format json, kita cari bagian content dari event stream
+          combined_text = ""
+          for line in raw_content.splitlines():
               try:
-                  # Bersihkan dan validasi JSON
-                  data = json.loads(json_str)
+                  data = json.loads(line)
+                  if 'content' in data:
+                      combined_text += data['content']
+              except:
+                  combined_text += line
+
+          # Cari kurung kurawal pertama dan terakhir untuk validasi JSON
+          match = re.search(r'(\{.*\})', combined_text, re.DOTALL)
+          
+          if match:
+              try:
+                  json_str = match.group(1)
+                  # Validasi apakah ini JSON beneran
+                  parsed = json.loads(json_str)
                   with open(output_path, 'w') as f:
-                      json.dump(data, f, indent=4)
-                  print("✅ Berhasil: Postman Collection telah dibuat.")
+                      json.dump(parsed, f, indent=4)
+                  print("✅ Berhasil: JSON disimpan ke Final_Audit_Postman.json")
                   sys.exit(0)
               except Exception as e:
-                  print(f"❌ JSON Malformed: {e}")
+                  print(f"❌ JSON malformed: {e}")
           
-          print("❌ AI tidak memberikan output JSON yang valid.")
-          print("--- PREVIEW LOG (500 chars) ---")
-          print(content[:500])
+          print("❌ AI gagal memberikan JSON valid.")
+          print("--- DEBUG LOG SNIPPET ---")
+          print(combined_text[:1000])
           sys.exit(1)
           EOF
 
-      ## 8. UPLOAD ARTIFACTS
+      ## 8. UPLOAD
       - name: Upload Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: audit-output
+          name: audit-results
           path: |
             Final_Audit_Postman.json
             agent_log.txt
