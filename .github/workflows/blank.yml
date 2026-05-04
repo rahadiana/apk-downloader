@@ -114,6 +114,60 @@ jobs:
           
           # Jalankan AI dan simpan hasilnya
           opencode run "$(cat prompt.txt)" > raw_ai_output.json
+          
+## 6. CLEANUP & PARSING JSON
+      - name: Finalize Postman Collection
+        run: |
+          python3 - << 'EOF'
+          import re, json, sys, os
+
+          def extract_json(text):
+              # Prioritas 1: Cari di dalam markdown code block
+              match = re.search(r'
+              ```json\s+(.*?)\s+```', text, re.DOTALL)
+              if match:
+                  return match.group(1)
+              
+              # Prioritas 2: Cari bracket { pertama sampai } terakhir
+              start = text.find('{')
+              end = text.rfind('}')
+              if start != -1 and end != -1:
+                  return text[start:end+1]
+              return None
+
+          try:
+              if not os.path.exists('raw_ai_output.json'):
+                  print("❌ Error: File raw_ai_output.json tidak ditemukan!")
+                  sys.exit(1)
+
+              with open('raw_ai_output.json', 'r', encoding='utf-8') as f:
+                  content = f.read()
+
+              print(">>> Menyeleksi JSON dari output AI...")
+              json_str = extract_json(content)
+              
+              if not json_str:
+                  print("❌ Error: AI tidak memberikan format JSON yang bisa dikenali.")
+                  print("--- RAW OUTPUT AI (500 chars) ---")
+                  print(content[:500])
+                  sys.exit(1)
+
+              # Validasi JSON
+              data = json.loads(json_str)
+              
+              # Simpan hasil akhir
+              with open('Final_Audit_Postman.json', 'w') as f:
+                  json.dump(data, f, indent=4)
+              
+              print("✅ Berhasil! File Final_Audit_Postman.json telah dibuat.")
+
+          except json.JSONDecodeError as e:
+              print(f"❌ Error: JSON Malformed! {e}")
+              sys.exit(1)
+          except Exception as e:
+              print(f"❌ Error Tak Terduga: {e}")
+              sys.exit(1)
+          EOF
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
