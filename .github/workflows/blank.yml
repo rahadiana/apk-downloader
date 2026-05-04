@@ -1,9 +1,14 @@
-name: Agentic APK Auditor - Hybrid Stable
+name: Agentic APK Auditor - Universal
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'URL APK yang ingin diaudit'
+        required: true
+        default: 'https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk'
 
 jobs:
   agentic-audit:
@@ -17,54 +22,135 @@ jobs:
       - name: Install Forensic Tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y wget unzip python3 jq curl grep
+          sudo apt-get install -y wget unzip python3 python3-pip jq curl
           wget https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
 
       - name: Fetch Target APK
         run: |
-          curl -L -o target.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk"
+          APK_URL="${{ github.event.inputs.apk_url || 'https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk' }}"
+          echo "Downloading: $APK_URL"
+          curl -L -o target.apk "$APK_URL"
           if [ ! -s target.apk ]; then echo "Download gagal!"; exit 1; fi
+          echo "Download OK: $(ls -lh target.apk | awk '{print $5}')"
 
       - name: Decompile APK
         run: |
           jadx target.apk -d extracted_source --no-res --show-bad-code --threads-count 4
+          echo "Total files: $(find extracted_source -name '*.java' | wc -l) java files"
 
-      - name: Map API Structure
+      - name: Build AI Context (Universal Deep Extraction)
         run: |
-          mkdir -p audit_hints
+          python3 << 'PYEOF'
+          import os, json, re
 
-          cd extracted_source/sources || exit 1
+          source_dir = 'extracted_source'
 
-          # Ambil semua baris API — lebih banyak konteks
-          grep -rE "@GET|@POST|@PUT|@DELETE|@PATCH|@HEAD|@OPTIONS|BASE_URL|@Query|@Path|@Body|@Header|@Field|Retrofit|OkHttp|http|https" . \
-            | grep -v "Binary\|\.class\|\.png\|\.jpg" \
-            | head -n 500 > ../../audit_hints/api_hints.txt || true
+          # -------------------------------------------------------
+          # UNIVERSAL KEYWORDS — berlaku untuk semua APK
+          # Deteksi otomatis pattern Retrofit, OkHttp, Volley,
+          # Apollo (GraphQL), gRPC, raw URL string, dll
+          # -------------------------------------------------------
+          NETWORK_KEYWORDS = [
+              # Retrofit annotations
+              '@GET', '@POST', '@PUT', '@DELETE', '@PATCH', '@HEAD', '@OPTIONS',
+              '@Query', '@Path', '@Body', '@Header', '@Headers', '@Field',
+              '@FormUrlEncoded', '@Multipart', '@Part', '@Url',
+              'retrofit2', 'Retrofit.Builder', 'baseUrl',
+              # OkHttp
+              'OkHttpClient', 'Request.Builder', 'HttpUrl',
+              # Volley
+              'RequestQueue', 'StringRequest', 'JsonObjectRequest',
+              # Apollo / GraphQL
+              'ApolloClient', 'graphql', 'mutation', 'query {',
+              # Generic URL patterns
+              'http://', 'https://',
+              '/api/', '/v1/', '/v2/', '/v3/',
+              # Auth
+              'Authorization', 'Bearer', 'X-Api-Key', 'api_key', 'token',
+              # Common class names
+              'ApiService', 'ApiClient', 'NetworkService', 'RemoteDataSource',
+              'RestClient', 'EndpointService',
+          ]
 
-          # Cari semua file API/Service/Retrofit/Network
-          find . -maxdepth 8 \( \
-            -name "*Api*" -o \
-            -name "*Service*" -o \
-            -name "*Retrofit*" -o \
-            -name "*Network*" -o \
-            -name "*Client*" -o \
-            -name "*Remote*" -o \
-            -name "*Endpoint*" \
-          \) > ../../audit_hints/file_map.txt || true
+          EXCLUDE_PATTERNS = [
+              'google', 'firebase', 'facebook', 'twitter', 'android.com',
+              'schema.org', 'w3.org', 'apache.org', 'junit', 'test',
+              'BuildConfig', 'R.string', '.png', '.jpg', '.svg', '.xml',
+          ]
 
-          # Dump isi file-file API yang ketemu (max 300 baris per file, total 5 file)
-          mkdir -p ../../audit_hints/source_files
-          head -5 ../../audit_hints/file_map.txt | while read f; do
-            fname=$(basename "$f")
-            head -n 300 "$f" > "../../audit_hints/source_files/${fname}.txt" 2>/dev/null || true
-          done
+          results = {
+              "base_urls": [],
+              "api_files": [],
+              "total_files_scanned": 0
+          }
 
-          cd ../..
+          seen_urls = set()
 
-          echo "=== API HINTS ($(wc -l < audit_hints/api_hints.txt) baris) ==="
-          echo "=== FILES DITEMUKAN ($(wc -l < audit_hints/file_map.txt) file) ==="
-          ls audit_hints/source_files/ 2>/dev/null || true
+          for root, _, files in os.walk(source_dir):
+              for file in files:
+                  if not file.endswith(('.java', '.kt')):
+                      continue
+
+                  path = os.path.join(root, file)
+                  results["total_files_scanned"] += 1
+
+                  try:
+                      with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                          content = f.read()
+                  except:
+                      continue
+
+                  # Skip file yang tidak relevan
+                  content_lower = content.lower()
+                  if any(ex.lower() in content_lower for ex in EXCLUDE_PATTERNS):
+                      # Tetap proses jika ada annotation Retrofit
+                      has_retrofit = any(k in content for k in ['@GET', '@POST', '@PUT', '@DELETE', 'retrofit2', 'OkHttp'])
+                      if not has_retrofit:
+                          continue
+
+                  # Cek apakah file ini relevan
+                  matched_keywords = [k for k in NETWORK_KEYWORDS if k in content]
+                  if not matched_keywords:
+                      continue
+
+                  # Ekstrak base URL dari file ini
+                  url_matches = re.findall(r'https?://[^\s\'"<>{}\\]+', content)
+                  for url in url_matches:
+                      # Ambil base URL saja (sampai path pertama)
+                      base = re.match(r'(https?://[^/\s]+(?:/[^/\s]+)?)', url)
+                      if base:
+                          clean = base.group(1).rstrip('.,;)')
+                          if clean not in seen_urls and len(clean) > 10:
+                              seen_urls.add(clean)
+                              results["base_urls"].append(clean)
+
+                  # Simpan file dengan konteks penuh
+                  results["api_files"].append({
+                      "file": os.path.relpath(path, source_dir),
+                      "matched_keywords": matched_keywords[:10],
+                      "content": content[:10000]  # 10rb karakter per file
+                  })
+
+          # Sort: file dengan paling banyak keyword duluan
+          results["api_files"].sort(key=lambda x: len(x["matched_keywords"]), reverse=True)
+
+          # Ambil top 20 file paling relevan
+          results["api_files"] = results["api_files"][:20]
+
+          print(f"Total files scanned: {results['total_files_scanned']}")
+          print(f"Relevant API files found: {len(results['api_files'])}")
+          print(f"Base URLs found: {len(results['base_urls'])}")
+          print("Top files:")
+          for f in results["api_files"][:5]:
+              print(f"  - {f['file']} [{', '.join(f['matched_keywords'][:3])}]")
+
+          with open('ai_input.json', 'w') as f:
+              json.dump(results, f, indent=2)
+
+          print("ai_input.json written.")
+          PYEOF
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v1
@@ -75,23 +161,59 @@ jobs:
         run: |
           bun install -g opencode-ai
 
-          # Attach semua file source yang ditemukan
-          FILE_ARGS=""
-          for f in audit_hints/source_files/*.txt; do
-            [ -f "$f" ] && FILE_ARGS="$FILE_ARGS -f $f"
-          done
+          # Buat prompt file pakai python — aman dari escaping issue
+          python3 -c "
+          import json
 
+          with open('ai_input.json', 'r') as f:
+              ctx = json.load(f)
+
+          base_urls = '\n'.join(ctx.get('base_urls', []))
+          file_count = len(ctx.get('api_files', []))
+
+          # Ringkas context: file name + keywords + content
+          files_summary = ''
+          for item in ctx.get('api_files', []):
+              files_summary += f\"\n\n=== FILE: {item['file']} ===\n\"
+              files_summary += f\"Keywords: {', '.join(item['matched_keywords'])}\n\"
+              files_summary += item['content'][:8000]
+
+          prompt = f'''You are an Elite API Security Researcher and Android reverse engineer.
+
+          I have decompiled an Android APK and extracted {file_count} relevant source files containing networking logic.
+
+          BASE URLS FOUND IN APK:
+          {base_urls}
+
+          YOUR TASK:
+          1. Analyze ALL the source files below carefully
+          2. Find EVERY real API endpoint (GET, POST, PUT, DELETE, etc)
+          3. Extract: base URL, path, HTTP method, query params, path params, request body, headers, auth tokens
+          4. Write a COMPLETE Postman Collection V2.1 JSON to a file named: Final_Audit_Postman.json
+          5. The JSON MUST have info and item keys
+          6. Only include endpoints that are actually found in the code — do NOT invent or guess
+          7. Group endpoints by feature/module
+
+          SOURCE FILES:
+          {files_summary[:40000]}
+          '''
+
+          with open('prompt.txt', 'w') as f:
+              f.write(prompt)
+
+          print(f'Prompt written: {len(prompt)} chars')
+          "
+
+          echo "Running opencode..."
           opencode run \
-            -f audit_hints/api_hints.txt \
-            -f audit_hints/file_map.txt \
-            $FILE_ARGS \
+            -f ai_input.json \
             --dangerously-skip-permissions \
-            "You are an expert Android API reverse engineer. Analyze ALL the attached source files carefully. Extract every real API endpoint, HTTP method, base URL, query params, path params, headers, and request/response body structure you can find. Then write a complete and accurate Postman Collection V2.1 JSON to a file named Final_Audit_Postman.json. The JSON must have info and item keys. Do not guess or invent endpoints — only include what is actually found in the source code." \
+            "$(cat prompt.txt)" \
             2>&1 | tee agent_log.txt || true
 
-          echo "=== FILES SETELAH OPENCODE ==="
+          echo "=== FILES AFTER OPENCODE ==="
           ls -la
-          find . -name "*.json" 2>/dev/null || true
+          find . -name "*.json" -newer ai_input.json 2>/dev/null || true
 
       - name: Validate Result
         run: |
@@ -114,7 +236,8 @@ jobs:
           if 'info' not in parsed or 'item' not in parsed:
               print(f'Bukan Postman Collection V2.1. Keys: {list(parsed.keys())}')
               sys.exit(1)
-          print(f'Sukses: {len(parsed.get(\"item\", []))} endpoint(s) ditemukan.')
+          endpoints = parsed.get('item', [])
+          print(f'Sukses: {len(endpoints)} endpoint(s) ditemukan.')
           "
 
       - name: Upload Results
@@ -125,4 +248,5 @@ jobs:
           path: |
             Final_Audit_Postman.json
             agent_log.txt
-            audit_hints/
+            ai_input.json
+            prompt.txt
