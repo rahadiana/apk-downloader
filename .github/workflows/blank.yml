@@ -1,4 +1,4 @@
-name: Agentic APK Auditor - Hybrid Stable
+name: Agentic APK Auditor - DEBUG
 
 on:
   push:
@@ -14,7 +14,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      ## 1. SETUP TOOLS
       - name: Install Forensic Tools
         run: |
           sudo apt-get update -qq
@@ -23,18 +22,15 @@ jobs:
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
 
-      ## 2. FETCH APK
       - name: Fetch Target APK
         run: |
           curl -L -o target.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk"
           if [ ! -s target.apk ]; then echo "❌ Download gagal!"; exit 1; fi
 
-      ## 3. DECOMPILE
       - name: Decompile APK
         run: |
           jadx target.apk -d extracted_source --no-res --show-bad-code --threads-count 4
 
-      ## 4. PRE-AUDIT MAPPING
       - name: Map API Structure
         run: |
           mkdir -p audit_hints
@@ -43,80 +39,51 @@ jobs:
           find . -maxdepth 5 -name "*Api*" -o -name "*Service*" > ../../audit_hints/file_map.txt || true
           cd ../..
 
-      ## 5. SETUP BUN
       - name: Setup Bun
         uses: oven-sh/setup-bun@v1
         with:
           bun-version: latest
 
-      ## 6. AGENTIC AI ANALYSIS
-      - name: Agentic Deep Audit
+      ## DEBUG: Cek semua info opencode
+      - name: Debug OpenCode CLI
         run: |
           bun install -g opencode-ai
+          echo "========== VERSION =========="
+          opencode --version 2>&1 || true
+          echo "========== HELP =========="
+          opencode --help 2>&1 || true
+          echo "========== RUN HELP =========="
+          opencode run --help 2>&1 || true
 
+      ## Jalankan opencode dan dump semua output
+      - name: Agentic Deep Audit
+        run: |
           API_HINTS=$(cat audit_hints/api_hints.txt)
           FILE_MAP=$(cat audit_hints/file_map.txt)
 
-          # Tulis prompt ke file — opencode akan baca via stdin pipe
-          cat > prompt.txt << PROMPT
-          You are an API reverse engineer. Analyze the following extracted Android APK source hints and create a valid Postman Collection V2.1 JSON file.
+          cat > prompt.txt << 'PROMPT'
+          You are an API reverse engineer. Based on the extracted Android APK source code hints below, create a valid Postman Collection V2.1 JSON file.
 
-          IMPORTANT: Write the final result ONLY as a raw JSON file saved to: Final_Audit_Postman.json
-          Do NOT output the JSON to stdout. Use file writing tools to save it directly.
-          The JSON must have "info" and "item" keys as per Postman Collection V2.1 spec.
+          IMPORTANT INSTRUCTIONS:
+          1. Save the output as a file named: Final_Audit_Postman.json
+          2. The JSON must follow Postman Collection V2.1 format with "info" and "item" keys.
+          3. Do not output JSON to the terminal — write it to the file directly.
 
           === API HINTS ===
-          ${API_HINTS}
-
-          === FILE MAP ===
-          ${FILE_MAP}
           PROMPT
 
-          # Jalankan opencode — dia akan tulis file Final_Audit_Postman.json sendiri
-          cat prompt.txt | opencode \
-            --dangerously-skip-permissions \
-            > agent_log.txt 2>&1 || echo "opencode finished"
+          echo "$API_HINTS" >> prompt.txt
+          echo "=== FILE MAP ===" >> prompt.txt
+          echo "$FILE_MAP" >> prompt.txt
 
-          echo "=== AGENT LOG ==="
-          cat agent_log.txt
+          echo "=== RUNNING OPENCODE ==="
+          cat prompt.txt | opencode --dangerously-skip-permissions 2>&1 | tee agent_log.txt || true
 
-      ## 7. VALIDASI OUTPUT
-      - name: Validate Result
-        run: |
-          python3 - << 'EOF'
-          import json, os, sys
+          echo "=== FILES AFTER OPENCODE ==="
+          ls -la
+          find . -name "*.json" 2>/dev/null || true
 
-          output_path = 'Final_Audit_Postman.json'
-
-          if not os.path.exists(output_path):
-              print("❌ Gagal: File Final_Audit_Postman.json tidak ditemukan.")
-              print("opencode tidak berhasil menulis file output.")
-              sys.exit(1)
-
-          with open(output_path, 'r', encoding='utf-8') as f:
-              content = f.read().strip()
-
-          if not content:
-              print("❌ Gagal: File Final_Audit_Postman.json kosong.")
-              sys.exit(1)
-
-          try:
-              parsed = json.loads(content)
-          except json.JSONDecodeError as e:
-              print(f"❌ Gagal: JSON tidak valid — {e}")
-              sys.exit(1)
-
-          if 'info' not in parsed or 'item' not in parsed:
-              print("❌ Gagal: JSON tidak memiliki key 'info' atau 'item' (bukan Postman Collection V2.1).")
-              print(f"Keys yang ada: {list(parsed.keys())}")
-              sys.exit(1)
-
-          print(f"✅ Sukses: Postman Collection valid dengan {len(parsed.get('item', []))} endpoint(s).")
-          sys.exit(0)
-          EOF
-
-      ## 8. UPLOAD
-      - name: Upload Results
+      - name: Upload Debug Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
