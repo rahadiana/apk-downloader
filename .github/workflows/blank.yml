@@ -1,4 +1,4 @@
-name: Agentic APK Auditor - Fixed Stable
+name: Agentic APK Auditor - Hybrid Stable
 
 on:
   push:
@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      ## 1. SETUP (JADX & Tools)
+      ## 1. SETUP TOOLS
       - name: Install Forensic Tools
         run: |
           sudo apt-get update -qq
@@ -28,90 +28,101 @@ jobs:
           curl -L -o target.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk"
           if [ ! -s target.apk ]; then echo "❌ Download gagal!"; exit 1; fi
 
-      ## 3. DECOMPILE
+      ## 3. DECOMPILE (DEX TO JAVA)
       - name: Decompile APK
         run: |
-          # Hanya ambil source untuk menghemat waktu dan ruang
           jadx target.apk -d extracted_source --no-res --show-bad-code --threads-count 4
 
-      ## 4. SETUP BUN & OPENCODE AI
+      ## 4. PRE-AUDIT (Helping the AI)
+      - name: Map API Structure
+        run: |
+          echo ">>> Mencari petunjuk API secara manual untuk AI..."
+          cd extracted_source/sources
+          # Cari file yang mengandung keyword API dan simpan ke file bantuan
+          grep -rE "@GET|@POST|BASE_URL|http" . > ../../api_hints.txt || true
+          find . -maxdepth 4 -name "*Api*" -o -name "*Service*" -o -name "*Client*" > ../../file_map.txt || true
+          cd ../..
+
+      ## 5. SETUP BUN & OPENCODE AI
       - name: Setup Bun
         uses: oven-sh/setup-bun@v1
         with:
           bun-version: latest
 
-      ## 5. AGENTIC AI ANALYSIS (FIXED FOR GITHUB ACTIONS)
+      ## 6. AGENTIC AI ANALYSIS (NON-INTERACTIVE)
       - name: Agentic Deep Audit
         run: |
           bun install -g opencode-ai
           
-          # Gunakan instruksi yang sangat spesifik untuk menghindari 'loop' atau 'permission denied'
+          # Buat instruksi yang menyertakan data Pre-Audit
           cat << 'EOF' > agent_instruction.txt
-          SYSTEM: You are a non-interactive Agentic Security Auditor.
-          WORKING_DIR: ./extracted_source/sources
+          SYSTEM: You are an Elite API Security Auditor.
+          
+          CONTEXT PROVIDED:
+          I have pre-scanned the APK source code for you.
+          - 'api_hints.txt' contains lines with networking keywords.
+          - 'file_map.txt' is the directory map of relevant files.
           
           TASK:
-          1. Use 'grep -rE "@GET|@POST|BASE_URL" .' to find networking files.
-          2. Use 'cat' to read the most important files.
-          3. Construct a Postman Collection V2.1 JSON.
+          1. Read 'api_hints.txt' and 'file_map.txt' to identify high-value files.
+          2. Use 'cat' to examine those files in 'extracted_source/sources'.
+          3. Generate a complete Postman Collection V2.1 JSON.
           
-          IMPORTANT:
-          - DO NOT explain your process.
-          - DO NOT ask for permission.
-          - ONLY output the JSON block inside markdown.
+          CONSTRAINT:
+          - Output ONLY the JSON block.
+          - No conversational filler.
           EOF
 
-          # Menjalankan opencode dengan 'yes' pipe untuk bypass konfirmasi shell
-          yes | opencode run "$(cat agent_instruction.txt)" --allow-shell --path ./extracted_source > agent_log.txt 2>&1 || true
+          # Gunakan --non-interactive jika didukung, atau bypass dengan pipe
+          # Kita simpan output ke file log
+          opencode run "$(cat agent_instruction.txt)" --allow-shell --path . > agent_log.txt 2>&1 || true
 
-      ## 6. FINAL EXTRACTION (SMART PARSING)
+      ## 7. FINAL EXTRACTION
       - name: Finalize Result
         run: |
           python3 - << 'EOF'
           import re, json, os, sys
           
           def extract_json(text):
-              # Prioritas: Ambil blok JSON terbesar di antara curly braces
-              matches = re.findall(r'(\{.*\})', text, re.DOTALL)
-              if matches:
-                  return max(matches, key=len)
+              # Mencari block JSON dengan regex yang lebih toleran
+              match = re.search(r'(\{.*\})', text, re.DOTALL)
+              if match:
+                  return match.group(1)
               return None
 
           log_path = 'agent_log.txt'
           output_path = 'Final_Audit_Postman.json'
 
-          if not os.path.exists(log_path):
-              print("❌ Log file not found")
-              sys.exit(1)
-
-          with open(log_path, 'r', encoding='utf-8') as f:
-              content = f.read()
-
-          json_str = extract_json(content)
-          if json_str:
-              try:
-                  # Bersihkan whitespace yang merusak parsing
-                  clean_data = json.loads(json_str)
-                  with open(output_path, 'w') as f:
-                      json.dump(clean_data, f, indent=4)
-                  print("✅ Final_Audit_Postman.json created successfully.")
-              except Exception as e:
-                  print(f"❌ JSON Parsing failed: {e}")
-                  # Save raw for debugging
-                  with open('failed_extract.txt', 'w') as f: f.write(json_str)
-                  sys.exit(1)
-          else:
-              print("❌ No JSON found in agent log.")
-              sys.exit(1)
+          if os.path.exists(log_path):
+              with open(log_path, 'r', encoding='utf-8') as f:
+                  content = f.read()
+              
+              json_str = extract_json(content)
+              if json_str:
+                  try:
+                      data = json.loads(json_str)
+                      with open(output_path, 'w') as f:
+                          json.dump(data, f, indent=4)
+                      print("✅ Berhasil: JSON diekstrak.")
+                      sys.exit(0)
+                  except Exception as e:
+                      print(f"❌ JSON malformed: {e}")
+              
+          print("❌ AI gagal memberikan JSON di log.")
+          # Tampilkan sedikit isi log untuk debug
+          if os.path.exists(log_path):
+              with open(log_path, 'r') as f: print(f.read()[:500])
+          sys.exit(1)
           EOF
 
-      ## 7. UPLOAD
+      ## 8. UPLOAD
       - name: Upload Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agentic-audit-results
+          name: hybrid-audit-results
           path: |
             Final_Audit_Postman.json
             agent_log.txt
-            failed_extract.txt
+            api_hints.txt
+            file_map.txt
