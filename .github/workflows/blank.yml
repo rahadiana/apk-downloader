@@ -27,7 +27,7 @@ jobs:
       - name: Fetch Sofascore APK
         run: |
           echo ">>> Mendownload Sofascore APK dari KilatStorage..."
-          curl -L -o sofascore.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sofascore.apk"
+          curl -L -o sofascore.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk"
           if [ ! -s sofascore.apk ]; then
             echo "❌ Download gagal atau file kosong!"
             exit 1
@@ -87,7 +87,7 @@ jobs:
               'Kamu adalah Elite API Security Researcher.\n'
               'Analisis kode dari APK Sofascore ini. Temukan:\n'
               '1. Base URL (Production & Staging jika ada).\n'
-              '2. Semua Endpoint (Live Score, Team Info, Player Stats).\n'
+              '2. Semua Endpoint.\n'
               '3. Header wajib (X-So-Auth, dll) dan API Keys.\n\n'
               'Buatlah Postman Collection V2.1 dalam JSON MURNI:\n' + ctx[:35000]
           )
