@@ -48,27 +48,25 @@ jobs:
         uses: oven-sh/setup-bun@v1
         with:
           bun-version: latest
-
-      ## 6. AGENTIC AI ANALYSIS (FIXED CLI)
+## 6. AGENTIC AI ANALYSIS (NO-KEY MODE)
       - name: Agentic Deep Audit
         run: |
           bun install -g opencode-ai
           
           cat << 'EOF' > agent_instruction.txt
-          TASK: Analyze 'audit_hints/api_hints.txt' and 'audit_hints/file_map.txt'.
-          Generate a Postman Collection V2.1 JSON for the discovered API endpoints.
-          Return ONLY the raw JSON object. No conversation.
+          Analyze the code in 'extracted_source/sources'. 
+          Map all API endpoints found in files matching '*Api*' or '*Service*'.
+          Return ONLY a valid Postman Collection V2.1 JSON.
           EOF
 
-          # MENGGUNAKAN FLAG DOKUMENTASI:
-          # --dangerously-skip-permissions: Agar tidak stuck minta izin baca file
-          # --format json: Agar output log berupa stream JSON
+          # Kita jalankan tanpa env OPENAI_API_KEY
+          # Pastikan flag --dangerously-skip-permissions tetap ada agar tidak macet
           opencode run "$(cat agent_instruction.txt)" \
             --dangerously-skip-permissions \
             --format json \
-            --path . > agent_log.txt 2>&1 || echo "AI process finished"
+            --path . > agent_log.txt 2>&1 || echo "AI Process Finished"
 
-      ## 7. FINAL EXTRACTION (PYTHON PARSER)
+      ## 7. FINAL EXTRACTION (LEBIH KUAT)
       - name: Finalize Result
         run: |
           python3 - << 'EOF'
@@ -78,44 +76,30 @@ jobs:
           output_path = 'Final_Audit_Postman.json'
 
           if not os.path.exists(log_path):
-              print("❌ Log file missing")
               sys.exit(1)
 
           with open(log_path, 'r', encoding='utf-8') as f:
-              raw_content = f.read()
+              content = f.read()
 
-          # Mencoba mencari JSON di dalam stream output
-          # Karena pakai --format json, kita cari bagian content dari event stream
-          combined_text = ""
-          for line in raw_content.splitlines():
+          # AI tanpa Key seringkali memberikan pesan error di awal, 
+          # kita cari JSON yang benar-benar valid saja
+          json_pattern = re.compile(r'(\{.*\})', re.DOTALL)
+          matches = json_pattern.findall(content)
+          
+          for match in reversed(matches): # Ambil dari yang paling akhir
               try:
-                  data = json.loads(line)
-                  if 'content' in data:
-                      combined_text += data['content']
+                  data = json.loads(match)
+                  if "info" in data and "item" in data: # Cek struktur Postman
+                      with open(output_path, 'w') as f:
+                          json.dump(data, f, indent=4)
+                      print("✅ Sukses mengekstrak Postman Collection.")
+                      sys.exit(0)
               except:
-                  combined_text += line
-
-          # Cari kurung kurawal pertama dan terakhir untuk validasi JSON
-          match = re.search(r'(\{.*\})', combined_text, re.DOTALL)
+                  continue
           
-          if match:
-              try:
-                  json_str = match.group(1)
-                  # Validasi apakah ini JSON beneran
-                  parsed = json.loads(json_str)
-                  with open(output_path, 'w') as f:
-                      json.dump(parsed, f, indent=4)
-                  print("✅ Berhasil: JSON disimpan ke Final_Audit_Postman.json")
-                  sys.exit(0)
-              except Exception as e:
-                  print(f"❌ JSON malformed: {e}")
-          
-          print("❌ AI gagal memberikan JSON valid.")
-          print("--- DEBUG LOG SNIPPET ---")
-          print(combined_text[:1000])
+          print("❌ Tidak ditemukan JSON Postman yang valid di log.")
           sys.exit(1)
           EOF
-
       ## 8. UPLOAD
       - name: Upload Results
         if: always()
