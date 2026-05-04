@@ -1,4 +1,4 @@
-name: Agentic APK Auditor - Stable Version
+name: Agentic APK Auditor - Fixed Stable
 
 on:
   push:
@@ -25,13 +25,13 @@ jobs:
       ## 2. FETCH APK
       - name: Fetch Target APK
         run: |
-          # Menggunakan link yang kamu berikan sebelumnya sebagai testing
           curl -L -o target.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk"
           if [ ! -s target.apk ]; then echo "❌ Download gagal!"; exit 1; fi
 
-      ## 3. DECOMPILE (DEX Only for speed)
+      ## 3. DECOMPILE
       - name: Decompile APK
         run: |
+          # Hanya ambil source untuk menghemat waktu dan ruang
           jadx target.apk -d extracted_source --no-res --show-bad-code --threads-count 4
 
       ## 4. SETUP BUN & OPENCODE AI
@@ -40,76 +40,73 @@ jobs:
         with:
           bun-version: latest
 
-      ## 5. AGENTIC AI ANALYSIS (REFINED)
+      ## 5. AGENTIC AI ANALYSIS (FIXED FOR GITHUB ACTIONS)
       - name: Agentic Deep Audit
         run: |
           bun install -g opencode-ai
           
-          # Kita buat instruksi yang lebih 'to-the-point'
-          # Kita minta AI menggunakan 'grep' secara eksplisit di awal
-          
+          # Gunakan instruksi yang sangat spesifik untuk menghindari 'loop' atau 'permission denied'
           cat << 'EOF' > agent_instruction.txt
-          Konteks: Kamu adalah Agentic AI yang memiliki akses shell ke folder 'extracted_source/sources'.
+          SYSTEM: You are a non-interactive Agentic Security Auditor.
+          WORKING_DIR: ./extracted_source/sources
           
-          Tujuan: Temukan semua API Endpoints dan buat Postman Collection V2.1.
+          TASK:
+          1. Use 'grep -rE "@GET|@POST|BASE_URL" .' to find networking files.
+          2. Use 'cat' to read the most important files.
+          3. Construct a Postman Collection V2.1 JSON.
           
-          Langkah Wajib:
-          1. Jalankan `grep -rE "@GET|@POST|BASE_URL|http" .` untuk memetakan file penting.
-          2. Baca file yang paling relevan dengan `cat [nama_file]`.
-          3. Analisis header (seperti Authorization atau API Keys).
-          
-          Output:
-          HANYA hasilkan JSON Postman Collection. Jangan ada penjelasan.
-          Jika sudah, simpan ke 'Final_Audit_Postman.json'.
+          IMPORTANT:
+          - DO NOT explain your process.
+          - DO NOT ask for permission.
+          - ONLY output the JSON block inside markdown.
           EOF
 
-          # Gunakan flag --allow-shell dengan proteksi path
-          opencode run "$(cat agent_instruction.txt)" --allow-shell --path ./extracted_source > agent_log.txt
+          # Menjalankan opencode dengan 'yes' pipe untuk bypass konfirmasi shell
+          yes | opencode run "$(cat agent_instruction.txt)" --allow-shell --path ./extracted_source > agent_log.txt 2>&1 || true
 
-      ## 6. ROBUST EXTRACTION (ANTI-ERROR)
+      ## 6. FINAL EXTRACTION (SMART PARSING)
       - name: Finalize Result
         run: |
           python3 - << 'EOF'
           import re, json, os, sys
           
-          def find_json(text):
-              # Mencari pola JSON di dalam log agent
+          def extract_json(text):
+              # Prioritas: Ambil blok JSON terbesar di antara curly braces
               matches = re.findall(r'(\{.*\})', text, re.DOTALL)
               if matches:
-                  # Ambil yang paling panjang (biasanya itu Postman Collection-nya)
                   return max(matches, key=len)
               return None
 
           log_path = 'agent_log.txt'
           output_path = 'Final_Audit_Postman.json'
 
-          if os.path.exists(log_path):
-              with open(log_path, 'r', encoding='utf-8') as f:
-                  content = f.read()
-              
-              json_data = find_json(content)
-              if json_data:
-                  try:
-                      # Validasi sebelum tulis
-                      parsed = json.loads(json_data)
-                      with open(output_path, 'w') as f:
-                          json.dump(parsed, f, indent=4)
-                      print("✅ JSON Berhasil diekstrak dan divalidasi.")
-                      sys.exit(0)
-                  except:
-                      print("⚠️ JSON ditemukan tapi malformed.")
-          
-          # Jika file sudah dibuat langsung oleh agent (seperti perintah di prompt)
-          if os.path.exists(output_path):
-              print("✅ File sudah dibuat langsung oleh agent.")
-              sys.exit(0)
-          
-          print("❌ Gagal menemukan hasil audit.")
-          sys.exit(1)
+          if not os.path.exists(log_path):
+              print("❌ Log file not found")
+              sys.exit(1)
+
+          with open(log_path, 'r', encoding='utf-8') as f:
+              content = f.read()
+
+          json_str = extract_json(content)
+          if json_str:
+              try:
+                  # Bersihkan whitespace yang merusak parsing
+                  clean_data = json.loads(json_str)
+                  with open(output_path, 'w') as f:
+                      json.dump(clean_data, f, indent=4)
+                  print("✅ Final_Audit_Postman.json created successfully.")
+              except Exception as e:
+                  print(f"❌ JSON Parsing failed: {e}")
+                  # Save raw for debugging
+                  with open('failed_extract.txt', 'w') as f: f.write(json_str)
+                  sys.exit(1)
+          else:
+              print("❌ No JSON found in agent log.")
+              sys.exit(1)
           EOF
 
       ## 7. UPLOAD
-      - name: Upload Audit Results
+      - name: Upload Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -117,3 +114,4 @@ jobs:
           path: |
             Final_Audit_Postman.json
             agent_log.txt
+            failed_extract.txt
