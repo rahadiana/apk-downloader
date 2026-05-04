@@ -1,4 +1,4 @@
-name: Agentic APK Auditor - DEBUG
+name: Agentic APK Auditor - Hybrid Stable
 
 on:
   push:
@@ -44,46 +44,72 @@ jobs:
         with:
           bun-version: latest
 
-      ## DEBUG: Cek semua info opencode
-      - name: Debug OpenCode CLI
-        run: |
-          bun install -g opencode-ai
-          echo "========== VERSION =========="
-          opencode --version 2>&1 || true
-          echo "========== HELP =========="
-          opencode --help 2>&1 || true
-          echo "========== RUN HELP =========="
-          opencode run --help 2>&1 || true
-
-      ## Jalankan opencode dan dump semua output
       - name: Agentic Deep Audit
         run: |
+          bun install -g opencode-ai
+
           API_HINTS=$(cat audit_hints/api_hints.txt)
           FILE_MAP=$(cat audit_hints/file_map.txt)
 
-          cat > prompt.txt << 'PROMPT'
-          You are an API reverse engineer. Based on the extracted Android APK source code hints below, create a valid Postman Collection V2.1 JSON file.
+          # Tulis prompt ke file supaya tidak ada masalah escaping
+          cat > prompt.txt << PROMPT
+You are an API reverse engineer. Analyze the extracted Android APK source hints below and create a valid Postman Collection V2.1 JSON file.
 
-          IMPORTANT INSTRUCTIONS:
-          1. Save the output as a file named: Final_Audit_Postman.json
-          2. The JSON must follow Postman Collection V2.1 format with "info" and "item" keys.
-          3. Do not output JSON to the terminal — write it to the file directly.
+CRITICAL INSTRUCTIONS:
+- Write the result to a file named exactly: Final_Audit_Postman.json
+- The JSON must have "info" and "item" keys (Postman Collection V2.1 format)
+- Do NOT print JSON to terminal, write it to the file using your file writing tools
 
-          === API HINTS ===
-          PROMPT
+=== API HINTS ===
+${API_HINTS}
 
-          echo "$API_HINTS" >> prompt.txt
-          echo "=== FILE MAP ===" >> prompt.txt
-          echo "$FILE_MAP" >> prompt.txt
+=== FILE MAP ===
+${FILE_MAP}
+PROMPT
 
-          echo "=== RUNNING OPENCODE ==="
-          cat prompt.txt | opencode --dangerously-skip-permissions 2>&1 | tee agent_log.txt || true
+          # Gunakan --prompt flag (bukan pipe/stdin) + --dangerously-skip-permissions
+          opencode run \
+            --prompt "$(cat prompt.txt)" \
+            --dangerously-skip-permissions \
+            2>&1 | tee agent_log.txt || true
 
-          echo "=== FILES AFTER OPENCODE ==="
+          echo "=== FILES SETELAH OPENCODE ==="
           ls -la
           find . -name "*.json" 2>/dev/null || true
 
-      - name: Upload Debug Results
+      - name: Validate Result
+        run: |
+          python3 - << 'EOF'
+          import json, os, sys
+
+          output_path = 'Final_Audit_Postman.json'
+
+          if not os.path.exists(output_path):
+              print("❌ Gagal: File Final_Audit_Postman.json tidak ditemukan.")
+              sys.exit(1)
+
+          with open(output_path, 'r', encoding='utf-8') as f:
+              content = f.read().strip()
+
+          if not content:
+              print("❌ Gagal: File kosong.")
+              sys.exit(1)
+
+          try:
+              parsed = json.loads(content)
+          except json.JSONDecodeError as e:
+              print(f"❌ JSON tidak valid: {e}")
+              sys.exit(1)
+
+          if 'info' not in parsed or 'item' not in parsed:
+              print(f"❌ Bukan Postman Collection V2.1. Keys ada: {list(parsed.keys())}")
+              sys.exit(1)
+
+          print(f"✅ Sukses: {len(parsed.get('item', []))} endpoint(s) ditemukan.")
+          sys.exit(0)
+          EOF
+
+      - name: Upload Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
