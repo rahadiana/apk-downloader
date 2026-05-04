@@ -1,4 +1,4 @@
-name: Universal AI APK Auditor
+name: Pro AI APK Auditor - Deep Endpoint Extraction
 
 on:
   push:
@@ -6,14 +6,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  audit-apk:
+  audit-pro:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
 
-      ## 1. SETUP TOOLS
+      ## 1. SETUP (Tetap sama)
       - name: Install Forensic Tools
         run: |
           sudo apt-get update -qq
@@ -22,96 +22,102 @@ jobs:
           unzip jadx-1.5.0.zip -d jadx
           sudo ln -s $(pwd)/jadx/bin/jadx /usr/local/bin/jadx
 
-      ## 2. DOWNLOAD APK (Ganti link ini dengan APK target)
+      ## 2. FETCH APK
       - name: Fetch Target APK
         run: |
-          echo ">>> Mendownload APK Target..."
-          # Ganti link di bawah ini dengan APK yang mau di-audit
-          curl -L -o target.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk"
-          if [ ! -s target.apk ]; then echo "❌ File kosong!"; exit 1; fi
+          curl -L -o target.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk" # <--- Ganti Ini
 
       ## 3. DECOMPILE
-      - name: Decompile Source Code
+      - name: Decompile
         run: |
           jadx target.apk -d extracted_source --no-res --show-bad-code --threads-count 4
 
-      ## 4. UNIVERSAL CONTEXT EXTRACTION
-      - name: Build AI Context
+      ## 4. PRO CONTEXT EXTRACTION (THE MAGIC)
+      - name: Smart Filter & Extraction
         run: |
           python3 - << 'EOF'
-          import os, json
-          source_dir = 'extracted_source'
-          context = {"api_logic": []}
+          import os, json, re
           
-          # Keyword networking universal
-          keywords = ['http', 'https://', 'api/', 'retrofit', '@get', '@post', 'okhttp', 'baseurl', 'endpoint']
+          source_dir = 'extracted_source/sources'
+          context = {"target_app_logic": []}
           
+          # Daftar folder yang HARUS diabaikan (SDK Sampah)
+          blacklist = [
+              'com/google', 'com/facebook', 'androidx', 'com/android', 
+              'kotlin', 'okhttp3', 'retrofit2', 'com/google/android',
+              'com/google/firebase', 'com/instabug', 'com/adjust'
+          ]
+
           for root, _, files in os.walk(source_dir):
+              # Skip folder blacklist
+              if any(b in root.replace('\\', '/') for b in blacklist):
+                  continue
+                  
               for file in files:
                   if file.endswith(('.java', '.kt')):
                       path = os.path.join(root, file)
                       try:
                           with open(path, 'r', encoding='utf-8') as f:
-                              content = f.read()
-                              if any(k in content.lower() for k in keywords):
-                                  context["api_logic"].append({
-                                      "file": file,
-                                      "snippet": content[:8000] 
+                              lines = f.readlines()
+                              
+                              # Hanya ambil baris yang relevan (Endpoint/URL/Auth)
+                              relevant_lines = []
+                              is_interesting = False
+                              for line in lines:
+                                  line = line.strip()
+                                  if any(k in line for k in ['@GET', '@POST', '@PUT', '@DELETE', 'BASE_URL', 'http://', 'https://', 'X-API-KEY', 'Authorization']):
+                                      relevant_lines.append(line)
+                                      is_interesting = True
+                              
+                              if is_interesting:
+                                  # Ambil maksimal 100 baris relevan per file agar tidak overload
+                                  context["target_app_logic"].append({
+                                      "file": os.path.relpath(path, source_dir),
+                                      "logic": "\n".join(relevant_lines[:100])
                                   })
                       except: continue
-          
+
           with open('ai_input.json', 'w') as f:
               json.dump(context, f, indent=2)
           EOF
 
-      ## 5. AI RUNNER (BLIND AUDIT)
-      - name: Setup Bun & AI Runner
-        uses: oven-sh/setup-bun@v1
-
-      - name: AI Audit & Postman Generation
+      ## 5. AI RUNNER (STRICT INSTRUCTION)
+      - name: AI Audit
         run: |
+          # Setup Bun dan runner di sini (seperti sebelumnya)
           bun install -g opencode-ai
           python3 -c "
           import json
           ctx = open('ai_input.json').read()
           prompt = (
-              'Kamu adalah Elite API Security Researcher.\n'
-              'Audit semua endpoint di kode ini. Identifikasi Base URL, '
-              'semua path API, dan headers/auth yang digunakan.\n'
-              'HANYA keluarkan JSON Postman Collection V2.1 yang valid.\n'
-              'Jangan ada penjelasan teks apapun.\n\n' + ctx[:35000]
+              'Konteks: Kamu adalah Senior Penetration Tester.\n'
+              'Analisis baris kode berikut yang diambil dari logika internal aplikasi (ignore SDK libraries).\n'
+              'Tugas:\n'
+              '1. Temukan Base URL yang unik untuk aplikasi ini.\n'
+              '2. List semua endpoint path beserta method (GET/POST) dan parameter.\n'
+              '3. Identifikasi header custom atau pola token auth.\n\n'
+              'Output harus 100% JSON Postman Collection V2.1. Tanpa teks pembuka/penutup.\n'
+              'Input Kode:\n' + ctx[:35000]
           )
           open('prompt.txt', 'w').write(prompt)
           "
           opencode run "$(cat prompt.txt)" > raw_ai_output.json
 
-      ## 6. CLEANUP & PARSING (Sama seperti sebelumnya)
-      - name: Finalize Postman Collection
+      ## 6. FINALIZING
+      - name: Save Result
         run: |
-          python3 - << 'EOF'
+          python3 -c "
           import re, json, sys
-          def extract_json(text):
-              match = re.search(r'```json\s+(.*?)\s+```', text, re.DOTALL)
-              if match: return match.group(1)
-              start, end = text.find('{'), text.rfind('}')
-              return text[start:end+1] if start != -1 else None
-
-          try:
-              with open('raw_ai_output.json', 'r') as f: content = f.read()
-              json_str = extract_json(content)
-              data = json.loads(json_str)
-              with open('Universal_API_Audit.postman_collection.json', 'w') as f:
+          content = open('raw_ai_output.json').read()
+          match = re.search(r'(\{.*\})', content, re.DOTALL)
+          if match:
+              data = json.loads(match.group(1))
+              with open('Final_Audit_Postman.json', 'w') as f:
                   json.dump(data, f, indent=4)
-              print("✅ Audit Selesai!")
-          except: sys.exit(1)
-          EOF
-
-      ## 7. ARTIFACTS
-      - name: Upload Results
-        if: always()
+          "
+      
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: api-audit-results
-          path: |
-            Universal_API_Audit.postman_collection.json
-            ai_input.json
+          name: pro-audit-results
+          path: Final_Audit_Postman.json
