@@ -25,7 +25,7 @@ jobs:
       - name: Fetch Target APK
         run: |
           curl -L -o target.apk "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Sports.apk"
-          if [ ! -s target.apk ]; then echo "❌ Download gagal!"; exit 1; fi
+          if [ ! -s target.apk ]; then echo "Download gagal!"; exit 1; fi
 
       - name: Decompile APK
         run: |
@@ -51,25 +51,27 @@ jobs:
           API_HINTS=$(cat audit_hints/api_hints.txt)
           FILE_MAP=$(cat audit_hints/file_map.txt)
 
-          # Tulis prompt ke file supaya tidak ada masalah escaping
-          cat > prompt.txt << PROMPT
-You are an API reverse engineer. Analyze the extracted Android APK source hints below and create a valid Postman Collection V2.1 JSON file.
+          # Tulis prompt ke file pakai printf — hindari heredoc agar tidak konflik YAML
+          printf '%s\n' \
+            "You are an API reverse engineer. Analyze the extracted Android APK source hints below." \
+            "Create a valid Postman Collection V2.1 JSON file." \
+            "" \
+            "CRITICAL INSTRUCTIONS:" \
+            "- Write the result to a file named exactly: Final_Audit_Postman.json" \
+            "- The JSON must have info and item keys (Postman Collection V2.1 format)" \
+            "- Do NOT print JSON to terminal, write it to the file using your file writing tools" \
+            "" \
+            "=== API HINTS ===" \
+            "$API_HINTS" \
+            "" \
+            "=== FILE MAP ===" \
+            "$FILE_MAP" \
+            > prompt.txt
 
-CRITICAL INSTRUCTIONS:
-- Write the result to a file named exactly: Final_Audit_Postman.json
-- The JSON must have "info" and "item" keys (Postman Collection V2.1 format)
-- Do NOT print JSON to terminal, write it to the file using your file writing tools
+          PROMPT_TEXT=$(cat prompt.txt)
 
-=== API HINTS ===
-${API_HINTS}
-
-=== FILE MAP ===
-${FILE_MAP}
-PROMPT
-
-          # Gunakan --prompt flag (bukan pipe/stdin) + --dangerously-skip-permissions
           opencode run \
-            --prompt "$(cat prompt.txt)" \
+            --prompt "$PROMPT_TEXT" \
             --dangerously-skip-permissions \
             2>&1 | tee agent_log.txt || true
 
@@ -79,35 +81,34 @@ PROMPT
 
       - name: Validate Result
         run: |
-          python3 - << 'EOF'
+          python3 -c "
           import json, os, sys
 
           output_path = 'Final_Audit_Postman.json'
 
           if not os.path.exists(output_path):
-              print("❌ Gagal: File Final_Audit_Postman.json tidak ditemukan.")
+              print('Gagal: File Final_Audit_Postman.json tidak ditemukan.')
               sys.exit(1)
 
           with open(output_path, 'r', encoding='utf-8') as f:
               content = f.read().strip()
 
           if not content:
-              print("❌ Gagal: File kosong.")
+              print('Gagal: File kosong.')
               sys.exit(1)
 
           try:
               parsed = json.loads(content)
           except json.JSONDecodeError as e:
-              print(f"❌ JSON tidak valid: {e}")
+              print(f'JSON tidak valid: {e}')
               sys.exit(1)
 
           if 'info' not in parsed or 'item' not in parsed:
-              print(f"❌ Bukan Postman Collection V2.1. Keys ada: {list(parsed.keys())}")
+              print(f'Bukan Postman Collection V2.1. Keys: {list(parsed.keys())}')
               sys.exit(1)
 
-          print(f"✅ Sukses: {len(parsed.get('item', []))} endpoint(s) ditemukan.")
-          sys.exit(0)
-          EOF
+          print(f'Sukses: {len(parsed.get(\"item\", []))} endpoint(s) ditemukan.')
+          "
 
       - name: Upload Results
         if: always()
