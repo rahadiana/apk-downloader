@@ -1,0 +1,532 @@
+# ================================================================
+#  🔍 ENTERPRISE APK API FINDER v4.0
+#  Strategy : Grep ALL signals → sed range extract → AI parse
+#  Works on : Obfuscated (ProGuard/R8) + Non-obfuscated APK
+#  Output   : Postman Collection v2.1
+# ================================================================
+
+name: 🔍 APK API Finder
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "🔗 URL APK target"
+        required: true
+        default: "https://s3-id-jkt-1.kilatstorage.id/source-code-brainly/Shopee.apk"
+      app_label:
+        description: "🏷️ Nama koleksi Postman"
+        required: false
+        default: "APK API Collection"
+
+concurrency:
+  group: apk-finder-${{ github.run_id }}
+  cancel-in-progress: false
+
+# ──────────────────────────────────────────────────────────────
+# JOB 1 — DECOMPILE
+# ──────────────────────────────────────────────────────────────
+jobs:
+  decompile:
+    name: "📦 Download & Decompile"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y wget unzip curl python3 --no-install-recommends
+          wget -q "https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip"
+          unzip -q jadx-1.5.0.zip -d jadx
+          sudo ln -sf "$(pwd)/jadx/bin/jadx" /usr/local/bin/jadx
+          echo "✅ JADX $(jadx --version)"
+
+      - name: Download APK
+        run: |
+          curl -L --retry 3 --max-time 300 -o target.apk \
+            "${{ github.event.inputs.apk_url }}"
+          [ -s target.apk ] || { echo "❌ Download gagal"; exit 1; }
+          echo "✅ $(du -sh target.apk | awk '{print $1}')"
+
+      - name: Decompile
+        run: |
+          jadx target.apk \
+            --output-dir extracted_source \
+            --no-res \
+            --show-bad-code \
+            --threads-count 4 2>&1 | tail -3
+          TOTAL=$(find extracted_source -name "*.java" | wc -l)
+          echo "✅ $TOTAL Java files"
+          [ "$TOTAL" -gt 0 ] || { echo "❌ Decompile gagal"; exit 1; }
+
+      - name: Upload Source
+        uses: actions/upload-artifact@v4
+        with:
+          name: decompiled-source
+          retention-days: 1
+          path: extracted_source/
+
+# ──────────────────────────────────────────────────────────────
+# JOB 2 — EXTRACT
+# Grep semua sinyal API → sed ambil range sekitar baris itu
+# Hasilnya: 1 file api_context.txt berisi semua snippet relevan
+# ──────────────────────────────────────────────────────────────
+  extract:
+    name: "🔎 Extract All API Signals"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: decompile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Source
+        uses: actions/download-artifact@v4
+        with:
+          name: decompiled-source
+          path: extracted_source/
+
+      - name: Grep ALL Signals
+        run: |
+          mkdir -p grep_results
+
+          # ── Non-obfuscated: Annotation-based ──────────────────
+          grep -rn '@GET\|@POST\|@PUT\|@DELETE\|@PATCH\|@HEAD\|@OPTIONS' \
+            extracted_source/ --include="*.java" \
+            > grep_results/annotations.txt 2>/dev/null || true
+
+          grep -rn '@Query\|@Path\|@Body\|@Field\|@Header\|@Url\|@Part' \
+            extracted_source/ --include="*.java" \
+            > grep_results/params.txt 2>/dev/null || true
+
+          # ── Obfuscated: String-based (URL tidak ikut obfuscate)
+          grep -rn '"/api/\|"/v1/\|"/v2/\|"/v3/\|"/graphql\|"/rest/\|"/mobile/' \
+            extracted_source/ --include="*.java" \
+            > grep_results/url_paths.txt 2>/dev/null || true
+
+          grep -rn '"https://\|"http://' \
+            extracted_source/ --include="*.java" \
+            > grep_results/full_urls.txt 2>/dev/null || true
+
+          grep -rn '"GET"\|"POST"\|"PUT"\|"DELETE"\|"PATCH"' \
+            extracted_source/ --include="*.java" \
+            > grep_results/method_strings.txt 2>/dev/null || true
+
+          grep -rn 'BASE_URL\|baseUrl\|API_URL\|SERVER_URL\|HOST\b\|ENDPOINT' \
+            extracted_source/ --include="*.java" \
+            > grep_results/base_urls.txt 2>/dev/null || true
+
+          grep -rn 'Authorization\|Bearer\|X-Api-Key\|api_key\|access_token' \
+            extracted_source/ --include="*.java" \
+            > grep_results/auth.txt 2>/dev/null || true
+
+          echo "=== Grep Results ==="
+          wc -l grep_results/*.txt
+
+      - name: "Build api_context.txt (sed range per match)"
+        run: |
+          python3 << 'PYEOF'
+          import os, re
+
+          GREP_DIR     = "grep_results"
+          SOURCE_DIR   = "extracted_source"
+          OUTPUT       = "api_context.txt"
+          LINES_BEFORE = 15   # baris sebelum match untuk lihat konteks class
+          LINES_AFTER  = 40   # baris sesudah match untuk lihat full method + params
+          MAX_SNIPPETS = 800  # batas agar context tidak overflow token AI
+
+          # ── Parse semua hasil grep → {filepath: set(line_numbers)} ──
+          file_lines = {}
+          pattern    = re.compile(r'^(.+?):(\d+):')
+
+          for fname in sorted(os.listdir(GREP_DIR)):
+            fpath = os.path.join(GREP_DIR, fname)
+            with open(fpath, encoding="utf-8", errors="ignore") as f:
+              for line in f:
+                m = pattern.match(line.strip())
+                if not m:
+                  continue
+                filepath = m.group(1)
+                lineno   = int(m.group(2))
+                file_lines.setdefault(filepath, set()).add(lineno)
+
+          print(f"📂 Files dengan sinyal API : {len(file_lines)}")
+
+          snippets      = []
+          snippet_count = 0
+
+          for filepath in sorted(file_lines.keys()):
+            if snippet_count >= MAX_SNIPPETS:
+              break
+
+            # Baca semua baris file sekali saja
+            try:
+              with open(filepath, encoding="utf-8", errors="ignore") as f:
+                all_lines = f.readlines()
+            except:
+              continue
+
+            total_lines  = len(all_lines)
+            sorted_lns   = sorted(file_lines[filepath])
+
+            # ── Merge ranges yang overlap / berdekatan (<5 baris gap) ──
+            ranges = []
+            for ln in sorted_lns:
+              start = max(1, ln - LINES_BEFORE)
+              end   = min(total_lines, ln + LINES_AFTER)
+              if ranges and start <= ranges[-1][1] + 5:
+                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+              else:
+                ranges.append((start, end))
+
+            rel_path = os.path.relpath(filepath, SOURCE_DIR)
+
+            for (start, end) in ranges:
+              if snippet_count >= MAX_SNIPPETS:
+                break
+              # slice 0-indexed
+              content = "".join(all_lines[start-1:end]).strip()
+              if not content:
+                continue
+
+              snippets.append(
+                f"\n{'='*60}\n"
+                f"FILE : {rel_path}\n"
+                f"LINES: {start}–{end}\n"
+                f"{'='*60}\n"
+                f"{content}\n"
+              )
+              snippet_count += 1
+
+          print(f"📋 Total snippets : {snippet_count}")
+
+          with open(OUTPUT, "w", encoding="utf-8") as f:
+            f.write(f"APP   : ${{ github.event.inputs.app_label }}\n")
+            f.write(f"FILES : {len(file_lines)}\n")
+            f.write(f"SNIPS : {snippet_count}\n\n")
+            f.writelines(snippets)
+
+          kb = os.path.getsize(OUTPUT) / 1024
+          print(f"✅ api_context.txt : {kb:.0f} KB")
+          PYEOF
+
+      - name: Upload Context
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-context
+          retention-days: 1
+          path: |
+            api_context.txt
+            grep_results/
+
+# ──────────────────────────────────────────────────────────────
+# JOB 3 — AI PARSE
+# opencode baca api_context.txt → tulis Postman collection
+# ──────────────────────────────────────────────────────────────
+  ai-parse:
+    name: "🤖 AI Parse → Postman"
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: extract
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Download Context
+        uses: actions/download-artifact@v4
+        with:
+          name: api-context
+
+      - name: Install opencode
+        run: bun install -g opencode-ai
+
+      - name: Write AGENTS.md
+        run: |
+          APP_LABEL="${{ github.event.inputs.app_label }}"
+          cat > AGENTS.md << AGENTEOF
+          # Role
+          You are a senior Android reverse engineer specializing in REST API
+          extraction from decompiled APK source code.
+
+          # Input File
+          \`api_context.txt\` — contains code snippets from a decompiled APK.
+          Each snippet shows FILE name and LINE RANGE so you know the context.
+          Snippets include: Retrofit annotations, URL strings, OkHttp calls,
+          query params, headers, auth patterns, and base URL constants.
+
+          # Your Task
+          1. Read \`api_context.txt\` from start to finish — do not skip
+          2. From every snippet, extract:
+             - HTTP Method  (GET / POST / PUT / DELETE / PATCH)
+             - Endpoint path  (e.g. /api/v2/users/{id})
+             - Query params   (@Query or ?key=value)
+             - Path params    (@Path or {placeholder})
+             - Request body   (@Body fields if visible)
+             - Auth / headers (Bearer, API key, custom headers)
+             - Base URL       (from constants or full URL strings)
+          3. Write \`postman_collection.json\` in Postman v2.1 format
+          4. After writing — output "DONE: X endpoints in Y folders" then STOP
+
+          # Postman v2.1 Structure
+          \`\`\`json
+          {
+            "info": {
+              "name": "${APP_LABEL}",
+              "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+            },
+            "variable": [
+              { "key": "base_url", "value": "<PRIMARY_BASE_URL>" },
+              { "key": "token",    "value": "" },
+              { "key": "api_key",  "value": "" }
+            ],
+            "item": [
+              {
+                "name": "Auth",
+                "item": [
+                  {
+                    "name": "POST /api/v2/auth/login",
+                    "request": {
+                      "method": "POST",
+                      "header": [
+                        { "key": "Authorization", "value": "Bearer {{token}}" },
+                        { "key": "Content-Type",  "value": "application/json" }
+                      ],
+                      "url": {
+                        "raw": "{{base_url}}/api/v2/auth/login",
+                        "host": ["{{base_url}}"],
+                        "path": ["api","v2","auth","login"],
+                        "variable": [],
+                        "query": []
+                      },
+                      "body": {
+                        "mode": "raw",
+                        "raw": "{\n  \"username\": \"\",\n  \"password\": \"\"\n}",
+                        "options": { "raw": { "language": "json" } }
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+          \`\`\`
+
+          # Grouping Rules
+          - Group by feature: Auth, User, Product, Order, Cart, Search, Feed, Payment, Misc
+          - If APK is obfuscated (class names like a.b.c) → group by URL prefix (/api/v1, /api/v2)
+          - Multiple base URLs → separate folder per domain
+
+          # Strict Rules
+          - NEVER invent endpoints — only from api_context.txt
+          - Use {{base_url}} {{token}} {{api_key}} as Postman variables
+          - Write the file EXACTLY ONCE — do not overwrite
+          AGENTEOF
+          echo "✅ AGENTS.md ready"
+
+      - name: "🤖 Run opencode Agent"
+        run: |
+          opencode run \
+            --dangerously-skip-permissions \
+            "Read api_context.txt fully. It contains code snippets with FILE and LINE RANGE labels. Extract every API endpoint. Write postman_collection.json in Postman v2.1 format. Group by feature module. Use Postman variables. Write once then stop." \
+            2>&1 | tee agent_log.txt || true
+          echo "=== Last 30 lines ==="
+          tail -30 agent_log.txt
+
+      - name: Locate Output File
+        id: locate
+        run: |
+          FOUND=$(find "$PWD" "$HOME" /tmp -maxdepth 5 \
+            -name "postman_collection.json" 2>/dev/null | head -1)
+          if [ -n "$FOUND" ] && [ "$FOUND" != "$PWD/postman_collection.json" ]; then
+            echo "📂 Found at: $FOUND — copying..."
+            cp "$FOUND" "$PWD/postman_collection.json"
+          fi
+          [ -f postman_collection.json ] \
+            && echo "found=true"  >> $GITHUB_OUTPUT \
+            || echo "found=false" >> $GITHUB_OUTPUT
+
+      # ── Fallback: regex parser jika AI gagal ──────────────
+      - name: "🛟 Fallback — Regex Parser"
+        if: steps.locate.outputs.found == 'false'
+        run: |
+          echo "⚠️ Agent gagal — menjalankan regex fallback"
+          python3 << 'PYEOF'
+          import json, re, os
+
+          APP   = "${{ github.event.inputs.app_label }}"
+          CTX   = open("api_context.txt", encoding="utf-8", errors="ignore").read()
+
+          M_RE  = re.compile(r'@(GET|POST|PUT|DELETE|PATCH|HEAD)\s*\(\s*["\']([^"\']+)["\']')
+          P_RE  = re.compile(r'"((?:/api/|/v\d/|/rest/|/mobile/|/graphql)[^"\s,)]{2,})"')
+
+          base_urls = list(dict.fromkeys(
+            re.match(r'(https?://[^/\s]+)', u).group(1)
+            for u in re.findall(r'https?://[^\s"\',)]{8,}', CTX)
+            if re.match(r'(https?://[^/\s]+)', u)
+          ))
+
+          folders, seen = {}, set()
+
+          # Retrofit annotations
+          for m in M_RE.finditer(CTX):
+            method, path = m.group(1), m.group(2)
+            key = f"{method}:{path}"
+            if key in seen: continue
+            seen.add(key)
+            ctx  = CTX[max(0, m.start()-300):m.start()]
+            mod  = next((w for w in
+                  ["Auth","User","Product","Order","Cart","Search",
+                   "Feed","Payment","Profile","Category","Checkout"]
+                  if w.lower() in ctx.lower()), "Misc")
+            parts = [p for p in path.strip("/").split("/") if p]
+            pvars = [{"key": v.strip("{}"),"value":"1"} for v in parts if "{" in v]
+            clean = "/".join(f":{v.strip('{}')}" if "{" in v else v for v in parts)
+            folders.setdefault(mod, []).append({
+              "name": f"{method} /{clean}",
+              "request": {
+                "method": method,
+                "header": [
+                  {"key":"Authorization","value":"Bearer {{token}}"},
+                  {"key":"Content-Type","value":"application/json"},
+                ],
+                "url": {
+                  "raw": "{{base_url}}/" + clean,
+                  "host": ["{{base_url}}"],
+                  "path": parts or [path],
+                  "variable": pvars, "query": [],
+                },
+                "body": {"mode":"raw","raw":"",
+                         "options":{"raw":{"language":"json"}}},
+              }
+            })
+
+          # Obfuscated URL strings
+          for m in P_RE.finditer(CTX):
+            path = m.group(1)
+            key  = f"?:{path}"
+            if key in seen: continue
+            seen.add(key)
+            parts = [p for p in path.strip("/").split("/") if p]
+            folders.setdefault("Uncategorized (Obfuscated)", []).append({
+              "name": f"? {path}",
+              "request": {
+                "method": "GET",
+                "header": [{"key":"Authorization","value":"Bearer {{token}}"}],
+                "url": {
+                  "raw": "{{base_url}}" + path,
+                  "host": ["{{base_url}}"],
+                  "path": parts, "variable": [], "query": [],
+                },
+                "body": {"mode":"raw","raw":"",
+                         "options":{"raw":{"language":"json"}}},
+              }
+            })
+
+          col = {
+            "info": {
+              "name": APP + " (fallback)",
+              "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+            },
+            "variable": [
+              {"key":"base_url","value": base_urls[0] if base_urls else ""},
+              {"key":"token","value":""},
+              {"key":"api_key","value":""},
+            ],
+            "item": [{"name":k,"item":v} for k,v in folders.items() if v],
+          }
+
+          total = sum(len(v) for v in folders.values())
+          json.dump(col, open("postman_collection.json","w"), indent=2)
+          print(f"✅ Fallback: {total} endpoints, {len(folders)} folders")
+          PYEOF
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: postman-raw
+          retention-days: 1
+          path: |
+            postman_collection.json
+            agent_log.txt
+
+# ──────────────────────────────────────────────────────────────
+# JOB 4 — VALIDATE & REPORT
+# ──────────────────────────────────────────────────────────────
+  report:
+    name: "✅ Validate & Final Report"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: ai-parse
+    steps:
+      - name: Download Collection
+        uses: actions/download-artifact@v4
+        with:
+          name: postman-raw
+
+      - name: Validate & GitHub Summary
+        run: |
+          python3 << 'PYEOF'
+          import json, sys, os, datetime
+
+          f = "postman_collection.json"
+          if not os.path.exists(f) or os.path.getsize(f) == 0:
+            print("❌ Output tidak ada"); sys.exit(1)
+
+          col = json.load(open(f))
+          assert "info" in col and "item" in col, "Bukan Postman v2.1"
+
+          methods = {}
+          def walk(items):
+            for it in items:
+              if "item" in it: walk(it["item"])
+              elif "request" in it:
+                m = it["request"].get("method","?")
+                methods[m] = methods.get(m,0) + 1
+          walk(col["item"])
+
+          total    = sum(methods.values())
+          folders  = col["item"]
+          base_url = next((v["value"] for v in col.get("variable",[])
+                          if v["key"]=="base_url"), "-")
+
+          md = f"""
+          # 🔍 APK API Finder — Hasil
+
+          | | |
+          |---|---|
+          | **App**       | ${{ github.event.inputs.app_label }} |
+          | **Run**       | #${{ github.run_number }} |
+          | **Waktu**     | {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} |
+          | **Base URL**  | \`{base_url}\` |
+          | **Endpoints** | **{total}** |
+          | **Folders**   | **{len(folders)}** |
+
+          ## 📊 HTTP Methods
+          {" | ".join(f"\`{m}\` ×{c}" for m,c in sorted(methods.items())) or "-"}
+
+          ## 📁 Modules
+          {chr(10).join(f"- **{f['name']}** — {len(f.get('item',[]))} endpoints" for f in folders)}
+
+          ---
+          > ✅ Download \`postman_collection.json\` dari Artifacts → Import ke Postman
+          """
+
+          print(md)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as g:
+            g.write(md)
+          PYEOF
+        env:
+          GITHUB_STEP_SUMMARY: ${{ github.step_summary }}
+
+      - name: "📤 Upload Final"
+        uses: actions/upload-artifact@v4
+        with:
+          name: "✅ ${{ github.event.inputs.app_label }} — Postman Collection"
+          retention-days: 30
+          path: |
+            postman_collection.json
+            agent_log.txt
