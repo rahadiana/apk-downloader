@@ -81,50 +81,81 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ripgrep --no-install-recommends
+          echo "✅ rg $(rg --version | head -1)"
+
       - name: Download Source
         uses: actions/download-artifact@v4
         with:
           name: decompiled-source
           path: extracted_source/
 
-      - name: Grep ALL Signals
+      # ── Deteksi apakah APK obfuscated atau tidak ────────────
+      - name: Detect Obfuscation Level
+        id: detect
+        run: |
+          ANNOT=$(rg -c '@(GET|POST|PUT|DELETE|PATCH)\(' \
+            extracted_source/ --type java 2>/dev/null \
+            | awk -F: '{s+=$2} END{print s+0}')
+          echo "annotation_hits=$ANNOT" >> $GITHUB_OUTPUT
+
+          if [ "$ANNOT" -gt 0 ]; then
+            echo "mode=retrofit"   >> $GITHUB_OUTPUT
+            echo "🟢 Non-obfuscated — Retrofit annotations ditemukan ($ANNOT hits)"
+          else
+            echo "mode=obfuscated" >> $GITHUB_OUTPUT
+            echo "🔴 Obfuscated — fallback ke URL string extraction"
+          fi
+
+      # ── MODE A: Non-obfuscated → grep annotations ───────────
+      - name: "Grep Retrofit Annotations (non-obfuscated)"
+        if: steps.detect.outputs.mode == 'retrofit'
+        run: |
+          mkdir -p grep_results
+          rg -n '@(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\(' \
+            extracted_source/ --type java \
+            > grep_results/annotations.txt 2>/dev/null || true
+          rg -n '@(Query|Path|Body|Field|Header|Part|QueryMap|FieldMap)\(' \
+            extracted_source/ --type java \
+            > grep_results/params.txt 2>/dev/null || true
+          rg -n 'BASE_URL|baseUrl|API_URL|SERVER_URL' \
+            extracted_source/ --type java \
+            > grep_results/base_urls.txt 2>/dev/null || true
+          wc -l grep_results/*.txt
+
+      # ── MODE B: Obfuscated → grep URL strings saja ──────────
+      - name: "Grep URL Strings (obfuscated)"
+        if: steps.detect.outputs.mode == 'obfuscated'
         run: |
           mkdir -p grep_results
 
-          # ── Non-obfuscated: Annotation-based ──────────────────
-          grep -rn '@GET\|@POST\|@PUT\|@DELETE\|@PATCH\|@HEAD\|@OPTIONS' \
-            extracted_source/ --include="*.java" \
-            > grep_results/annotations.txt 2>/dev/null || true
-
-          grep -rn '@Query\|@Path\|@Body\|@Field\|@Header\|@Url\|@Part' \
-            extracted_source/ --include="*.java" \
-            > grep_results/params.txt 2>/dev/null || true
-
-          # ── Obfuscated: String-based (URL tidak ikut obfuscate)
-          grep -rn '"/api/\|"/v1/\|"/v2/\|"/v3/\|"/graphql\|"/rest/\|"/mobile/' \
-            extracted_source/ --include="*.java" \
-            > grep_results/url_paths.txt 2>/dev/null || true
-
-          grep -rn '"https://\|"http://' \
-            extracted_source/ --include="*.java" \
+          # 1. Full https:// URL — paling banyak info
+          rg -n '"https?://[^"]{8,}"' \
+            extracted_source/ --type java \
             > grep_results/full_urls.txt 2>/dev/null || true
 
-          grep -rn '"GET"\|"POST"\|"PUT"\|"DELETE"\|"PATCH"' \
-            extracted_source/ --include="*.java" \
+          # 2. Path fragment — /api/ /v1/ /v2/ dll
+          rg -n '"/(?:api|v[0-9]+|rest|mobile|graphql|service|endpoint)[^"]*"' \
+            extracted_source/ --type java \
+            > grep_results/url_paths.txt 2>/dev/null || true
+
+          # 3. HTTP method string literal (OkHttp manual)
+          rg -n '"(GET|POST|PUT|DELETE|PATCH)"' \
+            extracted_source/ --type java \
             > grep_results/method_strings.txt 2>/dev/null || true
 
-          grep -rn 'BASE_URL\|baseUrl\|API_URL\|SERVER_URL\|HOST\b\|ENDPOINT' \
-            extracted_source/ --include="*.java" \
-            > grep_results/base_urls.txt 2>/dev/null || true
-
-          grep -rn 'Authorization\|Bearer\|X-Api-Key\|api_key\|access_token' \
-            extracted_source/ --include="*.java" \
+          # 4. Auth header strings
+          rg -n '"(Authorization|Bearer|X-Api-Key|api[_-]key|access[_-]token)"' \
+            extracted_source/ --type java \
             > grep_results/auth.txt 2>/dev/null || true
 
-          echo "=== Grep Results ==="
+          echo "=== Grep Results (obfuscated mode) ==="
           wc -l grep_results/*.txt
 
-      - name: "Build api_context.txt (sed range per match)"
+      - name: "Build api_context.txt — Tight Range (±20 baris)"
         run: |
           python3 << 'PYEOF'
           import os, re
@@ -132,83 +163,75 @@ jobs:
           GREP_DIR     = "grep_results"
           SOURCE_DIR   = "extracted_source"
           OUTPUT       = "api_context.txt"
-          LINES_BEFORE = 15   # baris sebelum match untuk lihat konteks class
-          LINES_AFTER  = 40   # baris sesudah match untuk lihat full method + params
-          MAX_SNIPPETS = 800  # batas agar context tidak overflow token AI
 
-          # ── Parse semua hasil grep → {filepath: set(line_numbers)} ──
+          # Obfuscated: range kecil sudah cukup — URL string ada di 1 baris
+          # Non-obfuscated: perlu lebih besar untuk tangkap params
+          MODE         = "${{ steps.detect.outputs.mode }}"
+          LINES_BEFORE = 10 if MODE == "obfuscated" else 15
+          LINES_AFTER  = 20 if MODE == "obfuscated" else 40
+          MAX_SNIPPETS = 600   # ~3k–6k baris total → ideal untuk opencode
+
           file_lines = {}
-          pattern    = re.compile(r'^(.+?):(\d+):')
+          pat = re.compile(r'^(.+?):(\d+):')
 
           for fname in sorted(os.listdir(GREP_DIR)):
             fpath = os.path.join(GREP_DIR, fname)
             with open(fpath, encoding="utf-8", errors="ignore") as f:
               for line in f:
-                m = pattern.match(line.strip())
-                if not m:
-                  continue
-                filepath = m.group(1)
-                lineno   = int(m.group(2))
-                file_lines.setdefault(filepath, set()).add(lineno)
+                m = pat.match(line.strip())
+                if not m: continue
+                fp, ln = m.group(1), int(m.group(2))
+                file_lines.setdefault(fp, set()).add(ln)
 
-          print(f"📂 Files dengan sinyal API : {len(file_lines)}")
+          print(f"📂 Files dengan sinyal : {len(file_lines)}")
 
-          snippets      = []
-          snippet_count = 0
+          snippets, count = [], 0
 
           for filepath in sorted(file_lines.keys()):
-            if snippet_count >= MAX_SNIPPETS:
-              break
-
-            # Baca semua baris file sekali saja
+            if count >= MAX_SNIPPETS: break
             try:
-              with open(filepath, encoding="utf-8", errors="ignore") as f:
-                all_lines = f.readlines()
+              lines = open(filepath, encoding="utf-8", errors="ignore").readlines()
             except:
               continue
 
-            total_lines  = len(all_lines)
-            sorted_lns   = sorted(file_lines[filepath])
+            total      = len(lines)
+            sorted_lns = sorted(file_lines[filepath])
+            ranges     = []
 
-            # ── Merge ranges yang overlap / berdekatan (<5 baris gap) ──
-            ranges = []
             for ln in sorted_lns:
-              start = max(1, ln - LINES_BEFORE)
-              end   = min(total_lines, ln + LINES_AFTER)
-              if ranges and start <= ranges[-1][1] + 5:
-                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+              s = max(1, ln - LINES_BEFORE)
+              e = min(total, ln + LINES_AFTER)
+              # Merge range yang overlap atau berdekatan ≤3 baris
+              if ranges and s <= ranges[-1][1] + 3:
+                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], e))
               else:
-                ranges.append((start, end))
+                ranges.append((s, e))
 
-            rel_path = os.path.relpath(filepath, SOURCE_DIR)
+            rel = os.path.relpath(filepath, SOURCE_DIR)
 
-            for (start, end) in ranges:
-              if snippet_count >= MAX_SNIPPETS:
-                break
-              # slice 0-indexed
-              content = "".join(all_lines[start-1:end]).strip()
-              if not content:
-                continue
-
+            for (s, e) in ranges:
+              if count >= MAX_SNIPPETS: break
+              chunk = "".join(lines[s-1:e]).strip()
+              if not chunk: continue
               snippets.append(
-                f"\n{'='*60}\n"
-                f"FILE : {rel_path}\n"
-                f"LINES: {start}–{end}\n"
-                f"{'='*60}\n"
-                f"{content}\n"
+                f"\n{'='*55}\n"
+                f"FILE : {rel}  [L{s}–{e}]\n"
+                f"{'='*55}\n"
+                f"{chunk}\n"
               )
-              snippet_count += 1
+              count += 1
 
-          print(f"📋 Total snippets : {snippet_count}")
+          print(f"📋 Snippets : {count}")
 
           with open(OUTPUT, "w", encoding="utf-8") as f:
-            f.write(f"APP   : ${{ github.event.inputs.app_label }}\n")
-            f.write(f"FILES : {len(file_lines)}\n")
-            f.write(f"SNIPS : {snippet_count}\n\n")
+            f.write(f"APP  : ${{ github.event.inputs.app_label }}\n")
+            f.write(f"MODE : {MODE}\n")
+            f.write(f"FILES: {len(file_lines)} | SNIPPETS: {count}\n\n")
             f.writelines(snippets)
 
+          lines_total = open(OUTPUT).read().count("\n")
           kb = os.path.getsize(OUTPUT) / 1024
-          print(f"✅ api_context.txt : {kb:.0f} KB")
+          print(f"✅ api_context.txt : {kb:.0f} KB | {lines_total} baris")
           PYEOF
 
       - name: Upload Context
